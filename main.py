@@ -89,7 +89,7 @@ def load_config() -> strategy.StrategyConfig:
         client_id=client_id,
         access_token=access_token,
         # Preserve the identifiers used by the existing Cloud scripts.
-        nifty_security_id=int(env_value("NIFTY_SECURITY_ID", "15")),
+        nifty_security_id=int(env_value("NIFTY_SECURITY_ID", "13")),
         nifty_exchange_segment=env_value("NIFTY_EXCHANGE_SEGMENT", "IDX_I"),
         nifty_instrument=env_value("NIFTY_INSTRUMENT", "INDEX"),
         nifty_option_underlying_security_id=int(env_value("NIFTY_OPTION_UNDERLYING_SECURITY_ID", "13")),
