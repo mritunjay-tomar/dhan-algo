@@ -1,0 +1,79 @@
+name: Dhan strategy
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Simulate signals without submitting orders
+        required: true
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
+      live_trading_enabled:
+        description: Permit live orders (DRY_RUN must also be false)
+        required: true
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+  schedule:
+    # Monday–Friday, 09:16 through 14:46 IST every 30 minutes.
+    - cron: '16,46 9-14 * * 1-5'
+      timezone: Asia/Kolkata
+    # Final cycle at 15:16 IST.
+    - cron: '16 15 * * 1-5'
+      timezone: Asia/Kolkata
+
+permissions:
+  contents: read
+
+# Scheduled and manual cycles must not run concurrently in this repository.
+concurrency:
+  group: dhan-strategy
+  cancel-in-progress: false
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run main.py
+        working-directory: gha
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          NIFTY_SECURITY_ID: ${{ vars.NIFTY_SECURITY_ID || '15' }}
+          NIFTY_EXCHANGE_SEGMENT: ${{ vars.NIFTY_EXCHANGE_SEGMENT || 'IDX_I' }}
+          NIFTY_INSTRUMENT: ${{ vars.NIFTY_INSTRUMENT || 'INDEX' }}
+          NIFTY_OPTION_UNDERLYING_SECURITY_ID: ${{ vars.NIFTY_OPTION_UNDERLYING_SECURITY_ID || '13' }}
+          NIFTY_QUANTITY: ${{ vars.NIFTY_QUANTITY || '1' }}
+          SUPERTREND_ATR_PERIOD: ${{ vars.SUPERTREND_ATR_PERIOD || '22' }}
+          SUPERTREND_MULTIPLIER: ${{ vars.SUPERTREND_MULTIPLIER || '4' }}
+          SUPERTREND_LOOKBACK_DAYS: ${{ vars.SUPERTREND_LOOKBACK_DAYS || '60' }}
+          DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
+          # Manual runs use the Actions form; scheduled runs use repository variables.
+          DRY_RUN: ${{ inputs.dry_run || vars.DRY_RUN || 'true' }}
+          LIVE_TRADING_ENABLED: ${{ inputs.live_trading_enabled || vars.LIVE_TRADING_ENABLED || 'false' }}
+        run: python main.py
