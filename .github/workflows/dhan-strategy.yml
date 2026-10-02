@@ -20,12 +20,12 @@ on:
           - 'false'
           - 'true'
   schedule:
-    # Monday–Friday, 09:16 through 14:46 IST every 30 minutes.
-    - cron: '16,46 9-14 * * 1-5'
-      timezone: Asia/Kolkata
-    # Final cycle at 15:16 IST.
-    - cron: '16 15 * * 1-5'
-      timezone: Asia/Kolkata
+    # 09:16 through 14:46 IST (03:46 through 09:16 UTC) every 30 mins, Mon–Fri
+    - cron: '46 3-8 * * 1-5'
+    - cron: '16 4-9 * * 1-5'
+
+    # Final cycle at 15:16 IST (09:46 UTC), Mon–Fri
+    - cron: '46 9 * * 1-5'
 
 permissions:
   contents: read
