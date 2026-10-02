@@ -55,7 +55,8 @@ class StrategyConfig:
     supertrend_atr_period: int = 22
     supertrend_multiplier: float = 4.0
     supertrend_lookback_days: int = 60
-    nifty_quantity: int = 1
+    nifty_quantity: int = 1  # Number of lots.
+    nifty_lot_size: int = 1  # Units per lot, supplied by the deployment configuration.
     request_timeout_seconds: float = 15.0
     dry_run: bool = True
     live_trading_enabled: bool = False
@@ -73,8 +74,14 @@ class StrategyConfig:
                 raise ValueError(f"{name} is required.")
         if self.supertrend_atr_period < 1 or self.supertrend_lookback_days < 1:
             raise ValueError("Supertrend period and lookback days must be positive.")
-        if self.nifty_quantity < 1 or self.request_timeout_seconds <= 0:
-            raise ValueError("Quantity and request timeout must be positive.")
+        if (
+            type(self.nifty_quantity) is not int
+            or self.nifty_quantity < 1
+            or type(self.nifty_lot_size) is not int
+            or self.nifty_lot_size < 1
+            or self.request_timeout_seconds <= 0
+        ):
+            raise ValueError("Lot count and lot size must be positive integers and request timeout must be positive.")
 
 
 @dataclass(frozen=True)
@@ -331,22 +338,31 @@ def spread_payoff(sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> d
 
 def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> list[dict[str, Any]]:
     """Enter a credit spread with market orders: buy protection, then sell risk."""
-    log_event("ENTRY_ORDER_INTENT", leg="BUY_PROTECTION", security_id=str(buy["security_id"]), transaction_type="BUY", quantity=quantity, order_type="MARKET", product_type="MARGIN")
-    buy_response = dhan.place_order(
-        security_id=str(buy["security_id"]), exchange_segment="NSE_FNO",
-        transaction_type="BUY", quantity=quantity, order_type="MARKET", product_type="MARGIN", price=0
-    )
-    log_event("ENTRY_ORDER_RESPONSE", leg="BUY_PROTECTION", security_id=str(buy["security_id"]), response=buy_response)
-    log_event("ENTRY_ORDER_INTENT", leg="SELL_SHORT", security_id=str(sell["security_id"]), transaction_type="SELL", quantity=quantity, order_type="MARKET", product_type="MARGIN")
-    sell_response = dhan.place_order(
-        security_id=str(sell["security_id"]), exchange_segment="NSE_FNO",
-        transaction_type="SELL", quantity=quantity, order_type="MARKET", product_type="MARGIN", price=0
-    )
-    log_event("ENTRY_ORDER_RESPONSE", leg="SELL_SHORT", security_id=str(sell["security_id"]), response=sell_response)
-    return [
-        {"leg": "BUY_PROTECTION", "security_id": str(buy["security_id"]), "response": buy_response},
-        {"leg": "SELL_SHORT", "security_id": str(sell["security_id"]), "response": sell_response},
-    ]
+    orders: list[dict[str, Any]] = []
+    for leg_name, leg, transaction_type in (
+        ("BUY_PROTECTION", buy, "BUY"),
+        ("SELL_SHORT", sell, "SELL"),
+    ):
+        security_id = str(leg["security_id"])
+        log_event("ENTRY_ORDER_INTENT", leg=leg_name, security_id=security_id, transaction_type=transaction_type, quantity=quantity, order_type="MARKET", product_type="MARGIN")
+        response = dhan.place_order(
+            security_id=security_id, exchange_segment="NSE_FNO",
+            transaction_type=transaction_type, quantity=quantity,
+            order_type="MARKET", product_type="MARGIN", price=0,
+        )
+        log_event("ENTRY_ORDER_RESPONSE", leg=leg_name, security_id=security_id, response=response)
+        order = {"leg": leg_name, "security_id": security_id, "quantity": quantity, "response": response}
+        orders.append(order)
+        if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
+            raise ValueError(f"{leg_name} order submission failed: {response}")
+        confirmed, statuses = wait_for_orders_traded(dhan, [order], phase="ENTRY")
+        if not confirmed:
+            raise ValueError(
+                f"{leg_name} was not confirmed fully filled; entry stopped. "
+                f"Check Dhan orders/positions before retrying; submitted orders may still be active. Details: {statuses}"
+            )
+    return orders
+
 
 
 def entry_check(
@@ -358,7 +374,7 @@ def entry_check(
 ) -> int:
     try:
         config.validate()
-        log_event("ENTRY_CHECK_STARTED", reentry=reentry, quantity=config.nifty_quantity, dry_run=config.dry_run, live_trading_enabled=config.live_trading_enabled)
+        log_event("ENTRY_CHECK_STARTED", reentry=reentry, lots=config.nifty_quantity, dry_run=config.dry_run, live_trading_enabled=config.live_trading_enabled)
         analysis = analysis or analyse_market(config)
         client_id, token = config.client_id, config.access_token
         segment = config.nifty_exchange_segment
@@ -373,15 +389,16 @@ def entry_check(
         expiry = next_expiry(dhan_request("/optionchain/expirylist", client_id, token, expiry_request, config.request_timeout_seconds))
         chain = dhan_request("/optionchain", client_id, token, {**expiry_request, "Expiry": expiry}, config.request_timeout_seconds)
         sell, buy = option_legs(chain, signal)
-        quantity = config.nifty_quantity
-        if quantity < 1:
-            raise ValueError("NIFTY_QUANTITY must be at least 1.")
+        lots = config.nifty_quantity
+        lot_size = config.nifty_lot_size
+        quantity = lots * lot_size
+        log_event("ENTRY_QUANTITY_RESOLVED", lots=lots, lot_size=lot_size, quantity=quantity)
         payoff = spread_payoff(sell, buy, quantity)
         log_event("ENTRY_LEGS_SELECTED", signal=signal, expiry=expiry, sell=sell, buy=buy, payoff=payoff, quantity=quantity)
         option_type = "PUT" if signal == "BULLISH" else "CALL"
         trigger = "current 30-minute Supertrend direction"
         print(f"{trigger}: propose next-expiry ({expiry}) {option_type} credit spread:")
-        output: dict[str, Any] = {"SELL": sell, "BUY": buy, "payoff": payoff, "quantity": quantity, "dry_run": config.dry_run}
+        output: dict[str, Any] = {"SELL": sell, "BUY": buy, "payoff": payoff, "lots": lots, "lot_size": lot_size, "quantity": quantity, "dry_run": config.dry_run}
         if not config.live_trading_enabled or config.dry_run:
             print(json.dumps(output, indent=2))
             log_event("DRY_RUN_REENTRY_SIGNAL" if reentry else "DRY_RUN_ENTRY_SIGNAL", signal=signal, expiry=expiry, sell=sell, buy=buy, payoff=payoff, quantity=quantity)
@@ -563,15 +580,16 @@ def order_details(response: dict[str, Any]) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
-    """Confirm every submitted exit order is fully traded before re-entry."""
+def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: str) -> tuple[bool, list[dict[str, Any]]]:
+    """Confirm submitted orders are fully filled before the next trading step."""
     tracked: list[dict[str, Any]] = []
     for order in orders:
         response = order.get("response")
         payload = order_details(response) if isinstance(response, dict) else {}
         order_id = payload.get("orderId")
-        if not isinstance(order_id, (str, int)) or not str(order_id):
-            log_event("EXIT_ORDER_CONFIRMATION_UNAVAILABLE", security_id=order.get("security_id"), response=response)
+        if (not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure"
+                or not isinstance(order_id, (str, int)) or not str(order_id)):
+            log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", security_id=order.get("security_id"), response=response)
             return False, tracked
         tracked.append({**order, "order_id": str(order_id)})
 
@@ -581,7 +599,11 @@ def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tupl
         latest_statuses = []
         all_traded = True
         for order in tracked:
-            payload = order_details(dhan.get_order_by_id(order["order_id"]))
+            status_response = dhan.get_order_by_id(order["order_id"])
+            if not isinstance(status_response, dict) or str(status_response.get("status", "")).lower() == "failure":
+                log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", order_id=order["order_id"], response=status_response)
+                return False, latest_statuses
+            payload = order_details(status_response)
             status = str(payload.get("orderStatus", "")).upper()
             filled_quantity = payload.get("filledQty")
             try:
@@ -598,17 +620,22 @@ def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tupl
             }
             latest_statuses.append(record)
             if status in {"REJECTED", "CANCELLED", "EXPIRED", "PART_TRADED"}:
-                log_event("EXIT_ORDER_NOT_FULLY_TRADED", order_statuses=latest_statuses)
+                log_event(f"{phase}_ORDER_NOT_FULLY_TRADED", order_statuses=latest_statuses)
                 return False, latest_statuses
             if status != "TRADED" or not fully_filled:
                 all_traded = False
         if all_traded:
-            log_event("EXIT_ORDERS_CONFIRMED_TRADED", order_statuses=latest_statuses)
+            log_event(f"{phase}_ORDERS_CONFIRMED_TRADED", order_statuses=latest_statuses)
             return True, latest_statuses
         if time.monotonic() >= deadline:
-            log_event("EXIT_ORDER_CONFIRMATION_TIMED_OUT", order_statuses=latest_statuses)
+            log_event(f"{phase}_ORDER_CONFIRMATION_TIMED_OUT", order_statuses=latest_statuses)
             return False, latest_statuses
         time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
+
+def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
+    """Confirm all exit orders before re-entry."""
+    return wait_for_orders_traded(dhan, orders, phase="EXIT")
+
 
 def close_debit(chain: dict[str, Any], state: dict[str, Any]) -> float:
     """Cost to close: buy short at ask, sell long at bid."""
