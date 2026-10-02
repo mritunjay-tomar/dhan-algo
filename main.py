@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import ssl
+import sys
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -16,6 +18,8 @@ import certifi
 import pyotp
 from dhanhq import DhanContext, dhanhq
 
+# Resolve the shared strategy even when invoked directly from outside the repo.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import strategy
 
 
@@ -89,11 +93,13 @@ def load_config() -> strategy.StrategyConfig:
         client_id=client_id,
         access_token=access_token,
         # Preserve the identifiers used by the existing Cloud scripts.
-        nifty_security_id=int(env_value("NIFTY_SECURITY_ID", "13")),
+        nifty_security_id=int(env_value("NIFTY_SECURITY_ID", "15")),
         nifty_exchange_segment=env_value("NIFTY_EXCHANGE_SEGMENT", "IDX_I"),
         nifty_instrument=env_value("NIFTY_INSTRUMENT", "INDEX"),
         nifty_option_underlying_security_id=int(env_value("NIFTY_OPTION_UNDERLYING_SECURITY_ID", "13")),
+        # Configured lot count and units per lot; the strategy multiplies them.
         nifty_quantity=int(env_value("NIFTY_QUANTITY", "1")),
+        nifty_lot_size=int(env_value("NIFTY_LOT_SIZE")),
         supertrend_atr_period=int(env_value("SUPERTREND_ATR_PERIOD", "22")),
         supertrend_multiplier=float(env_value("SUPERTREND_MULTIPLIER", "4")),
         supertrend_lookback_days=int(env_value("SUPERTREND_LOOKBACK_DAYS", "60")),
@@ -121,7 +127,7 @@ def main() -> int:
         config = load_config()
         dhan = dhanhq(DhanContext(config.client_id, config.access_token))
         LOGGER.info(
-            "Scheduled strategy run started: dry_run=%s live_trading_enabled=%s quantity=%s",
+            "Scheduled strategy run started: dry_run=%s live_trading_enabled=%s lots=%s",
             config.dry_run, config.live_trading_enabled, config.nifty_quantity,
         )
         return run_cycle(dhan, config)
