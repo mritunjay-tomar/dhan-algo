@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Run main.py
+      - name: Run gha/main.py
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           DHAN_PIN: ${{ secrets.DHAN_PIN }}
@@ -50,13 +50,15 @@ jobs:
           NIFTY_EXCHANGE_SEGMENT: ${{ vars.NIFTY_EXCHANGE_SEGMENT || 'IDX_I' }}
           NIFTY_INSTRUMENT: ${{ vars.NIFTY_INSTRUMENT || 'INDEX' }}
           NIFTY_OPTION_UNDERLYING_SECURITY_ID: ${{ vars.NIFTY_OPTION_UNDERLYING_SECURITY_ID || '13' }}
-          # Number of lots; the shared strategy fetches lot size and converts to units.
-          NIFTY_QUANTITY: ${{ vars.NIFTY_QUANTITY || '1' }}
+          # Required positive integer inputs. strategy.py sends lots × lot_size units to Dhan.
+          NIFTY_QUANTITY: ${{ vars.NIFTY_QUANTITY }}
+          NIFTY_LOT_SIZE: ${{ vars.NIFTY_LOT_SIZE }}
           SUPERTREND_ATR_PERIOD: ${{ vars.SUPERTREND_ATR_PERIOD || '22' }}
           SUPERTREND_MULTIPLIER: ${{ vars.SUPERTREND_MULTIPLIER || '4' }}
           SUPERTREND_LOOKBACK_DAYS: ${{ vars.SUPERTREND_LOOKBACK_DAYS || '60' }}
           DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
-          # Manual and scheduled runs both use repository variables.
-          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
-          LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED || 'false' }}
-        run: python main.py
+          # Required repository variables. gha/main.py rejects missing or empty values.
+          # Live orders require DRY_RUN=false and LIVE_TRADING_ENABLED=true.
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED }}
+        run: python gha/main.py
