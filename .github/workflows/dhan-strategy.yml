@@ -2,23 +2,6 @@ name: Dhan strategy
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: Simulate signals without submitting orders
-        required: true
-        type: choice
-        default: 'true'
-        options:
-          - 'true'
-          - 'false'
-      live_trading_enabled:
-        description: Permit live orders (DRY_RUN must also be false)
-        required: true
-        type: choice
-        default: 'false'
-        options:
-          - 'false'
-          - 'true'
   schedule:
     # 09:16 through 14:46 IST (03:46 through 09:16 UTC) every 30 mins, Mon–Fri
     - cron: '46 3-8 * * 1-5'
@@ -67,12 +50,13 @@ jobs:
           NIFTY_EXCHANGE_SEGMENT: ${{ vars.NIFTY_EXCHANGE_SEGMENT || 'IDX_I' }}
           NIFTY_INSTRUMENT: ${{ vars.NIFTY_INSTRUMENT || 'INDEX' }}
           NIFTY_OPTION_UNDERLYING_SECURITY_ID: ${{ vars.NIFTY_OPTION_UNDERLYING_SECURITY_ID || '13' }}
+          # Number of lots; the shared strategy fetches lot size and converts to units.
           NIFTY_QUANTITY: ${{ vars.NIFTY_QUANTITY || '1' }}
           SUPERTREND_ATR_PERIOD: ${{ vars.SUPERTREND_ATR_PERIOD || '22' }}
           SUPERTREND_MULTIPLIER: ${{ vars.SUPERTREND_MULTIPLIER || '4' }}
           SUPERTREND_LOOKBACK_DAYS: ${{ vars.SUPERTREND_LOOKBACK_DAYS || '60' }}
           DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
-          # Manual runs use the Actions form; scheduled runs use repository variables.
-          DRY_RUN: ${{ inputs.dry_run || vars.DRY_RUN || 'true' }}
-          LIVE_TRADING_ENABLED: ${{ inputs.live_trading_enabled || vars.LIVE_TRADING_ENABLED || 'false' }}
+          # Manual and scheduled runs both use repository variables.
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+          LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED || 'false' }}
         run: python main.py
