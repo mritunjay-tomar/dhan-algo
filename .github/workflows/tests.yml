@@ -1,0 +1,99 @@
+name: Strategy tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_dhan_integration:
+        description: 'Also run real Dhan API tests in dry-run mode'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Kolkata
+  PYTHONUNBUFFERED: '1'
+  DRY_RUN: 'true'
+  LIVE_TRADING_ENABLED: 'false'
+
+jobs:
+  unit:
+    name: Unit tests and coverage
+    # Keep pull-request code on an ephemeral runner without account credentials.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit --cov=dhan_algo --cov=main --cov-report=term-missing
+
+  dhan-integration:
+    name: Dhan API tests (dry run)
+    needs: unit
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_dhan_integration }}
+    runs-on: self-hosted
+    environment: main
+    timeout-minutes: 10
+    # Share the trading workflow's lock so authentication/API calls do not overlap.
+    concurrency:
+      group: dhan-strategy
+      cancel-in-progress: false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run real Dhan API tests with orders blocked
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          # Use the same runtime token-generation path as the trading workflow.
+          DHAN_ACCESS_TOKEN: ''
+          NIFTY_SECURITY_ID: ${{ vars.NIFTY_SECURITY_ID || '15' }}
+          NIFTY_EXCHANGE_SEGMENT: ${{ vars.NIFTY_EXCHANGE_SEGMENT || 'IDX_I' }}
+          NIFTY_INSTRUMENT: ${{ vars.NIFTY_INSTRUMENT || 'INDEX' }}
+          NIFTY_OPTION_UNDERLYING_SECURITY_ID: ${{ vars.NIFTY_OPTION_UNDERLYING_SECURITY_ID || '13' }}
+          NIFTY_QUANTITY: ${{ vars.NIFTY_QUANTITY }}
+          NIFTY_LOT_SIZE: ${{ vars.NIFTY_LOT_SIZE }}
+          SUPERTREND_ATR_PERIOD: ${{ vars.SUPERTREND_ATR_PERIOD || '22' }}
+          SUPERTREND_MULTIPLIER: ${{ vars.SUPERTREND_MULTIPLIER || '4' }}
+          SUPERTREND_LOOKBACK_DAYS: ${{ vars.SUPERTREND_LOOKBACK_DAYS || '60' }}
+          DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
+          # Always safe, regardless of the production repository variables.
+          DRY_RUN: 'true'
+          LIVE_TRADING_ENABLED: 'false'
+        run: python -m pytest tests/integration --dhan-integration -v --tb=short
