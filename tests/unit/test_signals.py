@@ -70,11 +70,37 @@ def test_all_shorts_must_hit(client,positions):
     assert short_legs_at_half_price(client,[])[0] is False
 
 
-@pytest.mark.parametrize("option,cross,hit", [("PUT","BEARISH",True),("PUT","BULLISH",False),
-    ("CALL","BULLISH",True),("CALL","BEARISH",False),("PUT",None,False)])
-def test_opposite_cross(analysis,positions,option,cross,hit):
+@pytest.mark.parametrize(
+    "option,latest_close,latest_supertrend,crossover_signal,hit",
+    [
+        ("PUT", 99, 100, "BULLISH", True),
+        ("PUT", 100, 100, "BEARISH", False),
+        ("PUT", 101, 100, "BEARISH", False),
+        ("CALL", 101, 100, "BEARISH", True),
+        ("CALL", 100, 100, "BULLISH", False),
+        ("CALL", 99, 100, "BULLISH", False),
+    ],
+)
+def test_opposite_supertrend_position(analysis, positions, option, latest_close, latest_supertrend, crossover_signal, hit):
     positions[0]["drvOptionType"] = option
-    assert opposite_supertrend_cross(replace(analysis,crossover_signal=cross),positions) is hit
+    updated_analysis = replace(
+        analysis,
+        candles=[{"close": latest_close}],
+        supertrend_values=[latest_supertrend],
+        crossover_signal=crossover_signal,
+    )
+    assert opposite_supertrend_cross(updated_analysis, positions) is hit
+
+
+def test_opposite_supertrend_position_requires_latest_indicator(analysis, positions):
+    assert not opposite_supertrend_cross(
+        replace(analysis, supertrend_values=[None]), positions
+    )
+
+
+def test_opposite_supertrend_position_rejects_mixed_short_option_types(analysis, positions):
+    positions.append({**positions[0], "securityId": "103", "drvOptionType": "CALL"})
+    assert not opposite_supertrend_cross(analysis, positions)
 
 
 @pytest.mark.parametrize("days,hit", [(-1,False),(0,True),(1,True),(2,True),(3,False)])
