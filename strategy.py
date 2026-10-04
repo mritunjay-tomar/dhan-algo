@@ -514,15 +514,29 @@ def short_legs_at_half_price(dhan: Any, positions: list[dict[str, Any]]) -> tupl
 
 
 def opposite_supertrend_cross(analysis: MarketAnalysis, positions: list[dict[str, Any]]) -> bool:
-    """Use the cycle's single Supertrend calculation to test an opposite cross."""
+    """Exit when the latest completed NIFTY candle is against the supertrend signal."""
     short_legs = short_option_positions(positions)
     option_types = {str(position["drvOptionType"]).upper() for position in short_legs}
     if option_types not in ({"PUT"}, {"CALL"}):
         return False
-    return (
-        (option_types == {"PUT"} and analysis.crossover_signal == "BEARISH")
-        or (option_types == {"CALL"} and analysis.crossover_signal == "BULLISH")
+    latest = len(analysis.candles) - 1
+    latest_supertrend = analysis.supertrend_values[latest]
+    if latest_supertrend is None:
+        return False
+
+    latest_close = analysis.candles[latest]["close"]
+    should_exit = (
+        (option_types == {"CALL"} and latest_close > latest_supertrend)
+        or (option_types == {"PUT"} and latest_close < latest_supertrend)
     )
+    log_event(
+        "SUPERTREND_POSITION_CHECKED",
+        short_option_type=next(iter(option_types)),
+        latest_close=latest_close,
+        latest_supertrend=latest_supertrend,
+        exit_required=should_exit,
+    )
+    return should_exit
 
 
 def bought_option_expiring_within_two_days(positions: list[dict[str, Any]]) -> bool:
@@ -662,7 +676,6 @@ def exit_check(
 ) -> int:
     config.validate()
     analysis = analysis or analyse_market(config)
-    log_event("EXIT_CHECK_STARTED", position_count=len(positions), dry_run=config.dry_run, live_trading_enabled=config.live_trading_enabled)
     target_reached, short_leg_checks = short_legs_at_half_price(dhan, positions)
     opposite_cross = opposite_supertrend_cross(analysis, positions)
     expiry_within_two_days = bought_option_expiring_within_two_days(positions)
