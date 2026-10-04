@@ -1,5 +1,5 @@
 certifi>=2024.0.0
 dhanhq==2.2.0
 pyotp>=2.9.0
-pandas>=2.3.2
+pandas>=2.3.2,<3
 pandas-ta==0.4.71b0
