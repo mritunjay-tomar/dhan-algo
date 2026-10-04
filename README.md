@@ -2,6 +2,61 @@
 
 Run one scheduled cycle through `main.py`. Strategies implement an ABC, have independent parameters, and run sequentially within the same invocation. One strategy failing produces a nonzero process exit code while the remaining strategies still run.
 
+## What this strategy trades
+
+The included strategy is a NIFTY **defined-risk credit spread** strategy. A credit spread earns a credit when it is opened, has a capped maximum loss, and is made from two options of the same type and expiry:
+
+- A **bullish** NIFTY view opens a put credit spread: sell a higher-strike put and buy a lower-strike put as protection.
+- A **bearish** NIFTY view opens a call credit spread: sell a lower-strike call and buy a higher-strike call as protection.
+
+It is intended for NIFTY F&O only, runs on completed 30-minute NIFTY candles, and uses the current Supertrend direction. It is not a backtester, a paper-trading ledger, or a guarantee of a trade. Dhan may reject orders, prices can move between quote and fill, and the actual credit, margin and P&L can differ from the proposal. Use dry-run until you have independently reviewed the proposed contracts and quantities.
+
+## Exact trading conditions
+
+Every cycle first reads the strategy's current NIFTY F&O positions.
+
+| Account state | Condition | Action |
+| --- | --- | --- |
+| No active position | Latest completed 30-minute NIFTY close is above Supertrend | Propose a next-expiry put credit spread. |
+| No active position | Latest completed 30-minute NIFTY close is at or below Supertrend | Propose a next-expiry call credit spread. |
+| Active spread | Every short option's LTP is at or below 52.5% of its recorded average sell price | Exit the spread to take profit. |
+| Active put spread | A completed 30-minute candle produces a bearish Supertrend crossover | Exit the spread. |
+| Active call spread | A completed 30-minute candle produces a bullish Supertrend crossover | Exit the spread. |
+| Active spread | Any long option expires today, tomorrow or in two calendar days | Exit the spread. |
+| Active spread | None of the exit conditions applies | Keep the position open. |
+
+The entry direction does **not** require a new crossover. A close exactly equal to Supertrend is treated as bearish. Supertrend defaults to ATR period 22 and multiplier 4, using the prior 60 calendar days of 15-minute Dhan candles resampled into NSE-aligned, completed 30-minute candles.
+
+After a live exit is fully confirmed and the scoped account is flat, the strategy immediately evaluates a re-entry using that same completed-candle direction. It can therefore open a new spread in the same scheduled cycle. It never re-enters after an incomplete exit or while an active scoped position remains.
+
+For an entry, the strategy sorts the active expiries returned by Dhan and selects the second one. It chooses the short option whose delta is closest to -0.50 for puts or +0.50 for calls. It chooses an out-of-the-money protective option whose premium is closest to half the short option premium. It will refuse to trade if Dhan has not provided valid contracts or executable bid/ask prices, or if the result is not a positive credit spread.
+
+Order quantity is `NIFTY_QUANTITY × NIFTY_LOT_SIZE`. Confirm the current lot size in Dhan before every expiry change; the application does not look it up automatically.
+
+## Worked example: bullish put credit spread
+
+This is an illustrative example only; strikes, premiums, contract IDs and lot sizes are deliberately made up.
+
+1. The completed 10:15 IST NIFTY candle closes at 25,120 while Supertrend is 25,070. The direction is bullish.
+2. The strategy selects the second expiry returned by Dhan, say 16 October.
+3. It finds a 25,000 put near delta -0.50, with bid ₹100, and a lower 24,900 put with ask ₹52. It proposes selling the 25,000 put and buying the 24,900 put.
+4. With `NIFTY_QUANTITY=1` and `NIFTY_LOT_SIZE=25`, it trades 25 units of each leg. The estimated credit is `(₹100 − ₹52) × 25 = ₹1,200`. Spread width is `₹100 × 25 = ₹2,500`, so the estimated maximum loss is `(₹100 − ₹48) × 25 = ₹1,300` before brokerage, taxes and slippage.
+5. If the short put's recorded sell average is ₹100, the profit exit is triggered at or below `₹52.50` (half price plus 5% tolerance), provided every short leg reaches its own target. A bearish Supertrend crossover or approaching long-leg expiry also triggers the exit.
+
+In live mode the application first buys and confirms the 24,900 protective put, then sells and confirms the 25,000 short put. On exit it buys back and confirms the short put before selling the protective put. If an order is rejected, partially filled, cancelled, expired, or not confirmed before the timeout, it stops; inspect Dhan orders and positions before trying again.
+
+## First run: beginner checklist
+
+1. Open a Dhan account with DhanHQ access, enable TOTP if you will generate access tokens, and ensure Dhan market-data/API access for NIFTY options is available.
+2. Install Python 3.12 or 3.13 and run the one-time setup below.
+3. Copy `.env.example` to `.env` if setup did not create it. Enter `CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP_SECRET`, `NIFTY_LOT_SIZE`, and keep `DRY_RUN=true` plus `LIVE_TRADING_ENABLED=false`.
+4. Check that `config/strategies.json` contains the default single strategy. Do not add `security_ids` for a dedicated strategy account.
+5. Export the `.env` values and run `main.py`. Read the proposed expiry, legs, quantity, credit, maximum loss and profit-booking amount in the output.
+6. Run the command during market hours several times with dry-run enabled. Dry-run uses live Dhan reads but never submits an order. It does not save a simulated position, so it can propose the same entry again on each independent run.
+7. Before any live run, verify the expiry, strikes, quantities, Dhan margin requirement, available funds, Dhan's current order/API requirements, and that the account does not contain unrelated NSE F&O positions. Change the flags only when you explicitly intend live order submission: `DRY_RUN=false` and `LIVE_TRADING_ENABLED=true`.
+
+The last step should be read literally: live submission happens only when `DRY_RUN=false` **and** `LIVE_TRADING_ENABLED=true`. Do not use the default unscoped strategy on an account that contains unrelated NIFTY F&O positions, because it regards those positions as its own.
+
 ## Layout
 
 ```text
@@ -120,4 +175,6 @@ Dhan's [production order API](https://dhanhq.co/docs/v2/orders/) does not docume
 
 ## Scheduling
 
-The existing `.github/workflows/dhan-strategy.yml` invokes `main.py` on a self-hosted runner, keeping its original 13 weekday cycles from 09:16 to 15:16 IST. Set the environment secrets/variables shown in that workflow. Configure the committed strategy JSON for multiple instances. Workflow concurrency prevents overlapping runs of that workflow; coordinate any other schedulers separately. `.github/workflows/tests.yml` runs the offline suite on pushes and pull requests with no Dhan credentials.
+The existing `.github/workflows/dhan-strategy.yml` invokes `main.py` on a self-hosted runner, keeping its original 13 weekday cycles from 09:16 to 15:16 IST. Set the environment secrets/variables shown in that workflow. Configure the committed strategy JSON for multiple instances. Workflow concurrency prevents overlapping runs of that workflow; coordinate any other schedulers separately. `.github/workflows/tests.yml` ("Strategy tests") runs the unit suite and coverage on pushes, pull requests and manual dispatches using an ephemeral Ubuntu runner with no Dhan credentials.
+
+For real API testing, open **Actions → Strategy tests → Run workflow**, enable **Also run real Dhan API tests in dry-run mode**, and start the workflow. After the unit suite passes, the integration job uses the same self-hosted runner, `main` environment, secrets, strategy variables and Python 3.12 settings as the trading workflow. It shares the trading workflow's concurrency lock. `DRY_RUN=true` and `LIVE_TRADING_ENABLED=false` are hardcoded for tests regardless of production variables. No additional secrets are required. Coverage and test results appear in the job logs.
