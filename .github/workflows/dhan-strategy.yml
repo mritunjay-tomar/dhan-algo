@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
   schedule:
     # 09:16 through 15:16 IST (03:46 through 09:46 UTC) every 30 mins, Mon-Fri
-    - cron: '46 3-9 * * 1-5'
-    - cron: '16 4-9 * * 1-5'
+    # - cron: '46 3-9 * * 1-5'
+    # - cron: '16 4-9 * * 1-5'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
