@@ -3,12 +3,9 @@ name: Dhan strategy
 on:
   workflow_dispatch:
   schedule:
-    # TEMPORARY DEBUG: every 5 minutes (GitHub's minimum), all days/hours.
-    # Restore the original schedule after debugging:
-    #   - cron: '46 3-9 * * 1-5'
-    #   - cron: '16 4-9 * * 1-5'
-    - cron: '2-59/5 * * * *'
-
+    # 09:16 through 15:16 IST (03:46 through 09:46 UTC) every 30 mins, Mon-Fri
+    - cron: '46 3-9 * * 1-5'
+    - cron: '16 4-9 * * 1-5'
 
 permissions:
   contents: read
@@ -27,19 +24,6 @@ jobs:
       TZ: Asia/Kolkata
       PYTHONUNBUFFERED: '1'
     steps:
-      - name: Debug - trigger and runner context
-        run: |
-          echo "event:       ${{ github.event_name }}"
-          echo "schedule:    ${{ github.event.schedule }}"
-          echo "ref:         ${{ github.ref }}"
-          echo "default br:  ${{ github.event.repository.default_branch }}"
-          echo "actor:       ${{ github.actor }}"
-          echo "runner:      ${{ runner.name }} (${{ runner.os }}/${{ runner.arch }})"
-          echo "UTC now:     $(date -u)"
-          echo "IST now:     $(TZ=Asia/Kolkata date)"
-          which python python3 || true
-          python --version || python3 --version || true
-
       - name: Check out repository
         uses: actions/checkout@v7
         with:
@@ -54,6 +38,59 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+
+      # Token cache: the key changes every 12 hours, so a cached token is at most ~12h old
+      # (Dhan tokens are valid for 24h).
+      - name: Compute 12-hour token cache bucket
+        id: bucket
+        run: echo "value=$(( $(date -u +%s) / 43200 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Dhan access token cache
+        id: token-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/dhan_token/token.txt
+          key: dhan-token-${{ steps.bucket.outputs.value }}
+
+      - name: Generate Dhan access token (cache miss)
+        if: steps.token-cache.outputs.cache-hit != 'true'
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
+          TOKEN_FILE: ${{ runner.temp }}/dhan_token/token.txt
+        run: |
+          mkdir -p "$(dirname "$TOKEN_FILE")"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from dhan_algo.auth import generate_access_token
+          token = generate_access_token(
+              os.environ["CLIENT_ID"],
+              os.environ["DHAN_PIN"],
+              os.environ["DHAN_TOTP_SECRET"],
+              float(os.environ["DHAN_REQUEST_TIMEOUT_SECONDS"]),
+          )
+          path = Path(os.environ["TOKEN_FILE"])
+          path.write_text(token)
+          path.chmod(0o600)
+          PY
+
+      - name: Save Dhan access token cache
+        if: steps.token-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dhan_token/token.txt
+          key: dhan-token-${{ steps.bucket.outputs.value }}
+
+      - name: Export Dhan access token
+        env:
+          TOKEN_FILE: ${{ runner.temp }}/dhan_token/token.txt
+        run: |
+          token="$(cat "$TOKEN_FILE")"
+          echo "::add-mask::$token"
+          echo "DHAN_ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
 
       - name: Run main.py
         env:
