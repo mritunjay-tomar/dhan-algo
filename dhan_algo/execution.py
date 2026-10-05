@@ -8,7 +8,12 @@ EXIT_ORDER_POLL_INTERVAL_SECONDS = 2.0
 EXIT_ORDER_POLL_TIMEOUT_SECONDS = 30.0
 
 def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> list[dict[str, Any]]:
-    """Enter a credit spread with market orders: buy protection, then sell risk."""
+    """Submit the protective buy, then immediately submit the short sell.
+
+    Dhan can acknowledge an order before its status endpoint reports a fill.
+    Entry therefore checks only that the buy submission was not rejected; it
+    deliberately does not poll for a fill before sending the sell order.
+    """
     orders: list[dict[str, Any]] = []
     for leg_name, leg, transaction_type in (
         ("BUY_PROTECTION", buy, "BUY"),
@@ -26,12 +31,6 @@ def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, An
         orders.append(order)
         if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
             raise ValueError(f"{leg_name} order submission failed: {response}")
-        confirmed, statuses = wait_for_orders_traded(dhan, [order], phase="ENTRY")
-        if not confirmed:
-            raise ValueError(
-                f"{leg_name} was not confirmed fully filled; entry stopped. "
-                f"Check Dhan orders/positions before retrying; submitted orders may still be active. Details: {statuses}"
-            )
     return orders
 
 
