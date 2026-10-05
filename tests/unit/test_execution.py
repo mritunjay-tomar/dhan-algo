@@ -14,16 +14,21 @@ def test_broker_never_submits_read_only(config,client,dry,enabled):
 def test_entry_buys_protection_before_short(client):
     execution.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
     assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list]==["BUY","SELL"]
-    assert [c[0] for c in client.mock_calls]==["place_order","get_order_by_id","place_order","get_order_by_id"]
+    client.get_order_by_id.assert_not_called()
 
 
-@pytest.mark.parametrize("status", ["REJECTED","CANCELLED","EXPIRED","PART_TRADED","PENDING","TRADED"])
-def test_unfilled_hedge_blocks_short(client,monkeypatch,status):
-    monkeypatch.setattr(execution,"EXIT_ORDER_POLL_TIMEOUT_SECONDS",0)
-    client.get_order_by_id.return_value={"data":{"orderStatus":status,"filledQty":10}}
+def test_failed_buy_submission_blocks_short(client):
+    client.place_order.return_value={"status":"failure"}
     with pytest.raises(ValueError):
         execution.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
     assert client.place_order.call_count==1
+
+
+def test_entry_submits_short_when_buy_fill_status_is_unavailable(client):
+    client.get_order_by_id.side_effect=AssertionError("Entry must not poll for a fill")
+    execution.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
+    assert [call.kwargs["transaction_type"] for call in client.place_order.call_args_list] == ["BUY", "SELL"]
+    client.get_order_by_id.assert_not_called()
 
 
 def test_exit_confirms_short_before_selling_hedge(client,positions):
