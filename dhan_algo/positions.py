@@ -77,32 +77,71 @@ def ltp_by_security_id(dhan: Any, positions: list[dict[str, Any]]) -> dict[str, 
     return prices
 
 
-def short_legs_at_half_price(dhan: Any, positions: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
-    """Check whether every short is within 5% above its half-price target or lower."""
-    short_legs = short_option_positions(positions)
-    if not short_legs:
-        return False, []
-    prices = ltp_by_security_id(dhan, short_legs)
-    checks: list[dict[str, Any]] = []
-    for position in short_legs:
-        security_id = str(position["securityId"])
-        original_sell_price = float(position["sellAvg"])
-        current_ltp = prices.get(security_id)
-        half_price_target = original_sell_price / 2
-        tolerance = half_price_target * 0.05
-        # A lower LTP has exceeded the profit target, so it remains an exit
-        # signal. The 5% tolerance permits an exit slightly before half price.
-        exit_trigger_price = half_price_target + tolerance
-        checks.append({
-            "security_id": security_id,
-            "original_sell_average": original_sell_price,
-            "current_ltp": current_ltp,
-            "half_original_sell_average": half_price_target,
-            "tolerance_amount": tolerance,
-            "exit_trigger_price": exit_trigger_price,
-            "target_reached": current_ltp is not None and 0 < current_ltp <= exit_trigger_price,
-        })
-    return all(check["target_reached"] for check in checks), checks
+def spread_profit_target_reached(
+    dhan: Any,
+    positions: list[dict[str, Any]],
+    lots: int,
+    lot_size: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Return whether running spread profit has reached 50% of maximum credit."""
+    live_options = [
+        position for position in positions
+        if str(position.get("exchangeSegment")) == "NSE_FNO"
+        and str(position.get("drvOptionType", "")).upper() in {"CALL", "PUT"}
+        and float(position.get("netQty", position.get("netQuantity", 0)) or 0) != 0
+    ]
+    short_legs = [position for position in live_options if float(position.get("netQty", position.get("netQuantity", 0)) or 0) < 0]
+    long_legs = [position for position in live_options if float(position.get("netQty", position.get("netQuantity", 0)) or 0) > 0]
+    check: dict[str, Any] = {
+        "lots": lots,
+        "lot_size": lot_size,
+        "quantity": lots * lot_size,
+        "target_fraction": 0.5,
+        "calculable": False,
+        "target_reached": False,
+    }
+    if len(short_legs) != 1 or len(long_legs) != 1:
+        check["reason"] = "Expected exactly one live short option and one live long option."
+        return False, check
+
+    short_leg, long_leg = short_legs[0], long_legs[0]
+    sell_average = short_leg.get("sellAvg")
+    buy_average = long_leg.get("buyAvg")
+    if not isinstance(sell_average, (int, float)) or not isinstance(buy_average, (int, float)):
+        check["reason"] = "Dhan positions are missing the sell or buy entry average."
+        return False, check
+
+    sell_average, buy_average = float(sell_average), float(buy_average)
+    quantity = lots * lot_size
+    maximum_profit = (sell_average - buy_average) * quantity
+    if sell_average <= 0 or buy_average < 0 or maximum_profit <= 0:
+        check["reason"] = "Position averages do not describe a positive-credit spread."
+        return False, check
+
+    prices = ltp_by_security_id(dhan, [short_leg, long_leg])
+    short_ltp = prices.get(str(short_leg["securityId"]))
+    long_ltp = prices.get(str(long_leg["securityId"]))
+    check.update({
+        "short_security_id": str(short_leg["securityId"]),
+        "long_security_id": str(long_leg["securityId"]),
+        "short_sell_average": sell_average,
+        "long_buy_average": buy_average,
+        "short_ltp": short_ltp,
+        "long_ltp": long_ltp,
+        "maximum_profit": maximum_profit,
+        "profit_booking_amount": maximum_profit * 0.5,
+    })
+    if short_ltp is None or long_ltp is None or short_ltp <= 0 or long_ltp <= 0:
+        check["reason"] = "A valid current LTP is unavailable for one or both spread legs."
+        return False, check
+
+    running_profit = ((sell_average - short_ltp) + (long_ltp - buy_average)) * quantity
+    check.update({
+        "running_profit": running_profit,
+        "calculable": True,
+        "target_reached": running_profit >= check["profit_booking_amount"],
+    })
+    return bool(check["target_reached"]), check
 
 
 def opposite_supertrend_cross(analysis: MarketAnalysis, positions: list[dict[str, Any]]) -> bool:

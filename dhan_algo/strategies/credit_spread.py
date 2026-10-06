@@ -8,7 +8,7 @@ from dhan_algo.config import StrategyConfig
 from dhan_algo.http import dhan_request
 from dhan_algo.market import MarketAnalysis, analyse_market
 from dhan_algo.options import next_expiry, option_legs, spread_payoff
-from dhan_algo.positions import (dhan_positions, active_strategy_position, short_legs_at_half_price,
+from dhan_algo.positions import (dhan_positions, active_strategy_position, spread_profit_target_reached,
                                  opposite_supertrend_cross, bought_option_expiring_within_two_days)
 from dhan_algo.execution import place_credit_spread_entry, close_open_fno_positions, wait_for_exit_orders_traded
 from dhan_algo.strategies.base import Strategy
@@ -90,21 +90,23 @@ def exit_check(
     config.validate()
     analysis = analysis or analyse_market(config)
     log_event("EXIT_CHECK_STARTED", position_count=len(positions), dry_run=config.dry_run, live_trading_enabled=config.live_trading_enabled)
-    target_reached, short_leg_checks = short_legs_at_half_price(dhan, positions)
+    target_reached, profit_check = spread_profit_target_reached(
+        dhan, positions, config.nifty_quantity, config.nifty_lot_size
+    )
     opposite_cross = opposite_supertrend_cross(analysis, positions)
     expiry_within_two_days = bought_option_expiring_within_two_days(positions)
     reasons: list[str] = []
     if target_reached:
-        reasons.append("ALL_SHORT_LEGS_AT_OR_BELOW_HALF_PRICE_WITH_5_PERCENT_TOLERANCE")
+        reasons.append("RUNNING_PROFIT_AT_OR_ABOVE_50_PERCENT_OF_MAXIMUM_PROFIT")
     if opposite_cross:
         reasons.append("OPPOSITE_30_MINUTE_SUPERTREND_CROSS")
     if expiry_within_two_days:
         reasons.append("LONG_OPTION_EXPIRY_WITHIN_TWO_DAYS")
-    log_event("EXIT_CONDITIONS_EVALUATED", target_reached=target_reached, opposite_supertrend_cross=opposite_cross, long_option_expiry_within_two_days=expiry_within_two_days, reasons=reasons, short_leg_checks=short_leg_checks)
+    log_event("EXIT_CONDITIONS_EVALUATED", target_reached=target_reached, opposite_supertrend_cross=opposite_cross, long_option_expiry_within_two_days=expiry_within_two_days, reasons=reasons, profit_check=profit_check)
     output: dict[str, Any] = {
         "exit_required": bool(reasons),
         "reasons": reasons,
-        "short_leg_checks": short_leg_checks,
+        "profit_check": profit_check,
         "current_positions": positions,
     }
     if not reasons:

@@ -23,13 +23,13 @@ def test_entry_read_only_flags(config,client,analysis,chain,monkeypatch,directio
 
 @pytest.mark.parametrize("target,cross,expiry", list(itertools.product([False,True],repeat=3)))
 def test_exit_reason_combinations(config,client,positions,analysis,monkeypatch,caplog,target,cross,expiry):
-    monkeypatch.setattr(strategy,"short_legs_at_half_price",lambda *_:(target,[]))
+    monkeypatch.setattr(strategy,"spread_profit_target_reached",lambda *_: (target,{}))
     monkeypatch.setattr(strategy,"opposite_supertrend_cross",lambda *_:cross)
     monkeypatch.setattr(strategy,"bought_option_expiring_within_two_days",lambda *_:expiry)
     with caplog.at_level("INFO"):
         assert strategy.exit_check(config,DhanBroker(client,config),positions,analysis=analysis)==0
     assert ("DRY_RUN_EXIT_SIGNAL" if any([target,cross,expiry]) else "NO_EXIT_SIGNAL") in caplog.text
-    for flag,reason in [(target,"ALL_SHORT_LEGS_AT_OR_BELOW_HALF_PRICE"),(cross,"OPPOSITE_30_MINUTE_SUPERTREND_CROSS"),(expiry,"LONG_OPTION_EXPIRY_WITHIN_TWO_DAYS")]:
+    for flag,reason in [(target,"RUNNING_PROFIT_AT_OR_ABOVE_50_PERCENT_OF_MAXIMUM_PROFIT"),(cross,"OPPOSITE_30_MINUTE_SUPERTREND_CROSS"),(expiry,"LONG_OPTION_EXPIRY_WITHIN_TWO_DAYS")]:
         assert (reason in caplog.text) is flag
     client.place_order.assert_not_called()
 
@@ -55,7 +55,7 @@ def test_cycle_shares_one_analysis(config,client,positions,analysis,monkeypatch,
 @pytest.mark.parametrize("filled,remaining,result", [(False,False,1),(True,True,1),(True,False,0)])
 def test_reentry_requires_confirmed_flat_account(config,client,positions,analysis,monkeypatch,filled,remaining,result):
     cfg=replace(config,dry_run=False,live_trading_enabled=True)
-    monkeypatch.setattr(strategy,"short_legs_at_half_price",lambda *_:(True,[]))
+    monkeypatch.setattr(strategy,"spread_profit_target_reached",lambda *_: (True,{}))
     monkeypatch.setattr(strategy,"close_open_fno_positions",Mock(return_value=[{}]))
     monkeypatch.setattr(strategy,"wait_for_exit_orders_traded",Mock(return_value=(filled,[])))
     client.get_positions.return_value={"data":positions if remaining else []}
@@ -87,7 +87,7 @@ def test_entry_rejected_order_returns_failure(config,client,analysis,chain,monke
 
 
 def test_exit_submission_failure_blocks_reentry(config,client,positions,analysis,monkeypatch):
-    monkeypatch.setattr(strategy,"short_legs_at_half_price",lambda *_:(True,[]))
+    monkeypatch.setattr(strategy,"spread_profit_target_reached",lambda *_: (True,{}))
     entry=Mock();monkeypatch.setattr(strategy,"entry_check",entry)
     client.place_order.side_effect=ValueError("fake rejection")
     cfg=replace(config,dry_run=False,live_trading_enabled=True)
@@ -97,7 +97,7 @@ def test_exit_submission_failure_blocks_reentry(config,client,positions,analysis
 
 @pytest.mark.parametrize("dry,enabled", [(True,False),(True,True),(False,False)])
 def test_actual_exit_target_read_only(config,client,positions,analysis,dry,enabled,caplog):
-    client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"]=50
+    client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"]=76
     cfg=replace(config,dry_run=dry,live_trading_enabled=enabled)
     with caplog.at_level("INFO"):
         assert strategy.exit_check(cfg,DhanBroker(client,cfg),positions,analysis=analysis)==0

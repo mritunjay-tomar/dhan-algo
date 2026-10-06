@@ -19,7 +19,7 @@ Every cycle first reads the strategy's current NIFTY F&O positions.
 | --- | --- | --- |
 | No active position | Latest completed 30-minute NIFTY close is above Supertrend | Propose a next-expiry put credit spread. |
 | No active position | Latest completed 30-minute NIFTY close is at or below Supertrend | Propose a next-expiry call credit spread. |
-| Active spread | Every short option's LTP is at or below 52.5% of its recorded average sell price | Exit the spread to take profit. |
+| Active spread | The spread's running profit is at least 50% of its maximum possible credit profit | Exit the spread to take profit. |
 | Active put spread | Latest completed 30-minute NIFTY close is below Supertrend | Exit the spread. |
 | Active call spread | Latest completed 30-minute NIFTY close is above Supertrend | Exit the spread. |
 | Active spread | Any long option expires today, tomorrow or in two calendar days | Exit the spread. |
@@ -41,7 +41,7 @@ This is an illustrative example only; strikes, premiums, contract IDs and lot si
 2. The strategy selects the second expiry returned by Dhan, say 16 October.
 3. It finds a 25,000 put near delta -0.50, with bid ₹100, and a lower 24,900 put with ask ₹52. It proposes selling the 25,000 put and buying the 24,900 put.
 4. With `NIFTY_QUANTITY=1` and `NIFTY_LOT_SIZE=25`, it trades 25 units of each leg. The estimated credit is `(₹100 − ₹52) × 25 = ₹1,200`. Spread width is `₹100 × 25 = ₹2,500`, so the estimated maximum loss is `(₹100 − ₹48) × 25 = ₹1,300` before brokerage, taxes and slippage.
-5. If the short put's recorded sell average is ₹100, the profit exit is triggered at or below `₹52.50` (half price plus 5% tolerance), provided every short leg reaches its own target. A completed candle closing below Supertrend or approaching long-leg expiry also triggers the exit.
+5. If the recorded sell average is ₹100 and the recorded protective-buy average is ₹52, maximum profit is `(₹100 − ₹52) × 25 = ₹1,200`. The profit exit triggers when the combined running P&L of both legs reaches ₹600 (50% of ₹1,200). A completed candle closing below Supertrend or approaching long-leg expiry also triggers the exit.
 
 In live mode the application submits the 24,900 protective put buy first and, once Dhan accepts that submission, immediately submits the 25,000 short-put sell. It does not wait for Dhan's order-status endpoint to report a fill between the two entry submissions. On exit it buys back and confirms the short put before selling the protective put. If an entry submission is rejected, or an exit order is partially filled, cancelled, expired, or not confirmed before the timeout, it stops; inspect Dhan orders and positions before trying again.
 
@@ -149,7 +149,7 @@ To add a different algorithm, subclass `Strategy` in `dhan_algo/strategies/`, im
 - Use completed, NSE-aligned 30-minute candles resampled from Dhan's 15-minute candles. Defaults: Supertrend ATR 22, multiplier 4, lookback 60 days.
 - Entry uses the current Supertrend direction, **without requiring a fresh crossover**: bullish → put credit spread; bearish → call credit spread. Equality to Supertrend remains bearish, matching the original rule.
 - Select the second listed expiry, short near absolute delta 0.50, and buy protection near half the short premium. Protection must now be on the correct out-of-the-money side. Reject missing contracts and invalid bid/ask credit payoffs.
-- Exit when all eligible shorts trade at or below 52.5% of sell average, the latest completed candle is on the adverse side of Supertrend, or a long option expires in 0–2 calendar days. Dates use Asia/Kolkata. Missing/zero quotes do not count as profit targets.
+- Exit when the combined running spread profit reaches at least 50% of maximum credit profit, the latest completed candle is on the adverse side of Supertrend, or a long option expires in 0–2 calendar days. Dates use Asia/Kolkata. Missing/zero quotes do not count as profit targets.
 - Submit the protective buy before the short sell, without waiting for entry fill confirmation. On exit, close and confirm the short before releasing protection. A rejected entry submission, or an incomplete exit, stops the remaining legs.
 - Re-entry requires fully traded exit orders and a fresh scoped position read showing no active positions. Pending orders are not automatically cancelled; after execution errors, reconcile orders/positions before retrying. There is no persistent order reconciliation service in this project.
 - Dry runs report entry/exit intent without submitting or simulating fills. They do not create persistent paper positions or claim that live execution succeeded.
@@ -161,7 +161,7 @@ To add a different algorithm, subclass `Strategy` in `dhan_algo/strategies/`, im
 .venv/bin/python -m pytest --cov=dhan_algo --cov-report=term-missing
 ```
 
-The default suite uses deterministic Dhan-shaped fixtures and prohibits network access. It covers both entry directions, expiry and contract selection, credit payoff validation, quantity conversion, crossover/equality boundaries, all eight exit-reason combinations, half-price tolerance, expiry day boundaries, malformed responses, every trading-flag combination, fill ordering, partial/rejected/cancelled/expired/pending orders, timeouts, re-entry gates, and multi-strategy isolation/failure handling. Order-lifecycle tests exercise execution against fakes, never the real broker.
+The default suite uses deterministic Dhan-shaped fixtures and prohibits network access. It covers both entry directions, expiry and contract selection, credit payoff validation, quantity conversion, crossover/equality boundaries, all eight exit-reason combinations, spread-level profit targets, expiry day boundaries, malformed responses, every trading-flag combination, fill ordering, partial/rejected/cancelled/expired/pending orders, timeouts, re-entry gates, and multi-strategy isolation/failure handling. Order-lifecycle tests exercise execution against fakes, never the real broker.
 
 To exercise **actual Dhan APIs in application dry-run mode**, export credentials and lot size, then run:
 

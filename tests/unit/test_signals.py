@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from dhan_algo.market import cross_signal, current_direction
 from dhan_algo.options import next_expiry, option_legs, spread_payoff
-from dhan_algo.positions import (short_legs_at_half_price, opposite_supertrend_cross,
+from dhan_algo.positions import (spread_profit_target_reached, opposite_supertrend_cross,
     bought_option_expiring_within_two_days, dhan_positions, active_strategy_position)
 
 
@@ -57,17 +57,25 @@ def test_missing_next_expiry(expiries):
     with pytest.raises(ValueError): next_expiry({"data":expiries})
 
 
-@pytest.mark.parametrize("price,hit", [(52.5,True),(52.5001,False),(50,True),(20,True),(0,False),(-1,False),(None,False)])
-def test_profit_target_boundary(client,positions,price,hit):
-    client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"] = price
-    assert short_legs_at_half_price(client,positions)[0] is hit
+@pytest.mark.parametrize("short_ltp,long_ltp,hit", [(76,52,True),(76.0001,52,False),(70,48,True),(80,52,False),(0,52,False),(76,None,False)])
+def test_spread_profit_target_boundary(client,positions,short_ltp,long_ltp,hit):
+    quotes = client.ticker_data.return_value["data"]["data"]["NSE_FNO"]
+    quotes["101"]["last_price"] = short_ltp
+    quotes["102"]["last_price"] = long_ltp
+    reached, check = spread_profit_target_reached(client,positions,1,25)
+    assert reached is hit
+    assert check["maximum_profit"] == 1200
+    assert check["profit_booking_amount"] == 600
 
 
-def test_all_shorts_must_hit(client,positions):
-    positions.append({**positions[0],"securityId":"103"})
-    client.ticker_data.return_value["data"]["data"]["NSE_FNO"] = {"101":{"last_price":40},"103":{"last_price":80}}
-    assert not short_legs_at_half_price(client,positions)[0]
-    assert short_legs_at_half_price(client,[])[0] is False
+@pytest.mark.parametrize("mutate", [
+    lambda positions: positions.clear(),
+    lambda positions: positions[1].pop("buyAvg"),
+    lambda positions: positions.append({**positions[0], "securityId": "103"}),
+])
+def test_spread_profit_requires_complete_single_spread(client,positions,mutate):
+    mutate(positions)
+    assert spread_profit_target_reached(client,positions,1,25)[0] is False
 
 
 @pytest.mark.parametrize(

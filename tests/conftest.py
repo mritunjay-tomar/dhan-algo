@@ -43,14 +43,16 @@ def positions():
     return [dict(securityId="101", exchangeSegment="NSE_FNO", netQty=-25,
                  sellAvg=100, drvOptionType="PUT", productType="MARGIN"),
             dict(securityId="102", exchangeSegment="NSE_FNO", netQty=25,
-                 drvOptionType="PUT", drvExpiryDate="2099-01-01", productType="MARGIN")]
+                 buyAvg=52, drvOptionType="PUT", drvExpiryDate="2099-01-01", productType="MARGIN")]
 
 
 @pytest.fixture
 def client():
     client = Mock(spec=["get_positions", "ticker_data", "place_order", "get_order_by_id"])
     client.get_positions.return_value = {"status": "success", "data": []}
-    client.ticker_data.return_value = {"status": "success", "data": {"data": {"NSE_FNO": {"101": {"last_price": 80}}}}}
+    client.ticker_data.return_value = {"status": "success", "data": {"data": {"NSE_FNO": {
+        "101": {"last_price": 80}, "102": {"last_price": 52}
+    }}}}
     client.place_order.return_value = {"status": "success", "data": {"orderId": "order-1"}}
     client.get_order_by_id.return_value = {"status": "success", "data": {"orderStatus": "TRADED", "filledQty": 25}}
     return client
