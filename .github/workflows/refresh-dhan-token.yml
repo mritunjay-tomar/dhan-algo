@@ -21,21 +21,18 @@ jobs:
     env:
       TZ: Asia/Kolkata
       PYTHONUNBUFFERED: '1'
+      PYTHON_BIN: /home/github/venvs/dhan-algo/bin/python
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+      - name: Verify managed Python environment
+        run: |
+          test -x "$PYTHON_BIN"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -c "import pyotp"
 
       - name: Generate Dhan access token
         env:
@@ -44,7 +41,7 @@ jobs:
           DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
           DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
         run: |
-          token="$(python - <<'PY'
+          token="$("$PYTHON_BIN" - <<'PY'
           import os
           from dhan_algo.auth import generate_access_token
 

@@ -54,6 +54,8 @@ jobs:
     runs-on: self-hosted
     environment: main
     timeout-minutes: 10
+    env:
+      PYTHON_BIN: /home/github/venvs/dhan-algo/bin/python
     # Share the trading workflow's lock so authentication/API calls do not overlap.
     concurrency:
       group: dhan-strategy
@@ -64,17 +66,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
+      - name: Verify managed Python environment
+        run: |
+          test -x "$PYTHON_BIN"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -c "import dhanhq, pandas, pyotp, pytest"
 
       - name: Run real Dhan API tests with orders blocked
         env:
@@ -96,4 +92,4 @@ jobs:
           # Always safe, regardless of the production repository variables.
           DRY_RUN: 'true'
           LIVE_TRADING_ENABLED: 'false'
-        run: python -m pytest tests/integration --dhan-integration -v --tb=short
+        run: '"$PYTHON_BIN" -m pytest tests/integration --dhan-integration -v --tb=short'
