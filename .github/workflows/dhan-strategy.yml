@@ -35,64 +35,19 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      # Token cache: the key changes every 12 hours, so a cached token is at most ~12h old
-      # (Dhan tokens are valid for 24h).
-      - name: Compute 12-hour token cache bucket
-        id: bucket
-        run: echo "value=$(( $(date -u +%s) / 43200 ))" >> "$GITHUB_OUTPUT"
-
-      - name: Restore Dhan access token cache
-        id: token-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/dhan_token/token.txt
-          key: dhan-token-${{ steps.bucket.outputs.value }}
-
-      - name: Generate Dhan access token (cache miss)
-        if: steps.token-cache.outputs.cache-hit != 'true'
+      - name: Verify Dhan access token secret
         env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          DHAN_PIN: ${{ secrets.DHAN_PIN }}
-          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
-          DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
-          TOKEN_FILE: ${{ runner.temp }}/dhan_token/token.txt
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
         run: |
-          mkdir -p "$(dirname "$TOKEN_FILE")"
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from dhan_algo.auth import generate_access_token
-          token = generate_access_token(
-              os.environ["CLIENT_ID"],
-              os.environ["DHAN_PIN"],
-              os.environ["DHAN_TOTP_SECRET"],
-              float(os.environ["DHAN_REQUEST_TIMEOUT_SECONDS"]),
-          )
-          path = Path(os.environ["TOKEN_FILE"])
-          path.write_text(token)
-          path.chmod(0o600)
-          PY
-
-      - name: Save Dhan access token cache
-        if: steps.token-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/dhan_token/token.txt
-          key: dhan-token-${{ steps.bucket.outputs.value }}
-
-      - name: Export Dhan access token
-        env:
-          TOKEN_FILE: ${{ runner.temp }}/dhan_token/token.txt
-        run: |
-          token="$(cat "$TOKEN_FILE")"
-          echo "::add-mask::$token"
-          echo "DHAN_ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
+          if [ -z "$DHAN_ACCESS_TOKEN" ]; then
+            echo "DHAN_ACCESS_TOKEN is missing from the main environment." >&2
+            exit 1
+          fi
 
       - name: Run main.py
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          DHAN_PIN: ${{ secrets.DHAN_PIN }}
-          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
           NIFTY_SECURITY_ID: ${{ vars.NIFTY_SECURITY_ID || '15' }}
           NIFTY_EXCHANGE_SEGMENT: ${{ vars.NIFTY_EXCHANGE_SEGMENT || 'IDX_I' }}
           NIFTY_INSTRUMENT: ${{ vars.NIFTY_INSTRUMENT || 'INDEX' }}
