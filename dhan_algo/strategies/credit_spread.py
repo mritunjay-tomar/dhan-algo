@@ -10,7 +10,7 @@ from dhan_algo.market import MarketAnalysis, analyse_market
 from dhan_algo.options import next_expiry, option_legs, spread_payoff
 from dhan_algo.positions import (dhan_positions, active_strategy_position, spread_profit_target_reached,
                                  opposite_supertrend_cross, bought_option_expiring_within_two_days)
-from dhan_algo.execution import place_credit_spread_entry, close_open_fno_positions, wait_for_exit_orders_traded
+from dhan_algo.execution import place_credit_spread_entry, close_open_fno_positions
 from dhan_algo.strategies.base import Strategy
 
 
@@ -126,23 +126,15 @@ def exit_check(
         print(json.dumps(output, indent=2, default=str))
         log_event("EXIT_ORDER_FAILURE", **output)
         return 1
-    exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
-    output["exit_order_statuses"] = order_statuses
-    if not exit_confirmed:
-        output["note"] = "Exit orders were submitted but were not all confirmed fully traded; re-entry was skipped."
-        print(json.dumps(output, indent=2, default=str))
-        log_event("EXIT_REENTRY_SKIPPED", **output)
-        return 1
-
     remaining_positions = dhan_positions(dhan)
     if active_strategy_position(remaining_positions):
         output["remaining_positions"] = remaining_positions
-        output["note"] = "Exit orders were filled, but active F&O positions remain; re-entry was skipped."
+        output["note"] = "Exit market orders submitted; positions not yet flat, re-entry deferred to next cycle."
         print(json.dumps(output, indent=2, default=str))
-        log_event("EXIT_REENTRY_SKIPPED", **output)
-        return 1
+        log_event("EXIT_SUBMITTED_REENTRY_DEFERRED", **output)
+        return 0
 
-    output["note"] = "Exit orders were confirmed fully traded; starting immediate re-entry."
+    output["note"] = "Exit market orders submitted and positions are flat; starting immediate re-entry."
     print(json.dumps(output, indent=2, default=str))
     log_event("EXIT_CONFIRMED_REENTRY_STARTED", **output)
     return entry_check(config, dhan, analysis=analysis, reentry=True)
