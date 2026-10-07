@@ -64,9 +64,10 @@ def close_open_fno_positions(dhan: Any, positions: list[dict[str, Any]]) -> list
             "quantity": quantity,
             "response": response,
         })
-        confirmed, _ = wait_for_orders_traded(dhan, [responses[-1]], phase="EXIT")
-        if not confirmed:
-            raise ValueError("Exit leg not fully filled; remaining legs and re-entry blocked.")
+        # No fill polling: only stop if Dhan outright rejects the submission,
+        # so a long hedge is never sold while its short leg failed to be sent.
+        if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
+            raise ValueError(f"Exit order submission failed for {position['securityId']}: {response}")
     return responses
 
 
