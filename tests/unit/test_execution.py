@@ -31,15 +31,16 @@ def test_entry_submits_short_when_buy_fill_status_is_unavailable(client):
     client.get_order_by_id.assert_not_called()
 
 
-def test_exit_confirms_short_before_selling_hedge(client,positions):
+def test_exit_closes_short_before_hedge_without_waiting(client,positions):
     execution.close_open_fno_positions(client,list(reversed(positions)))
     assert [c.kwargs["security_id"] for c in client.place_order.call_args_list]==["101","102"]
-    assert [c[0] for c in client.mock_calls]==["place_order","get_order_by_id","place_order","get_order_by_id"]
-    assert all(c.kwargs["price"]==0 for c in client.place_order.call_args_list)
+    assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list]==["BUY","SELL"]
+    assert all(c.kwargs["order_type"]=="MARKET" and c.kwargs["price"]==0 for c in client.place_order.call_args_list)
+    client.get_order_by_id.assert_not_called()
 
 
-def test_failed_short_exit_keeps_hedge(client,positions):
-    client.get_order_by_id.return_value={"data":{"orderStatus":"REJECTED","filledQty":0}}
+def test_rejected_short_exit_submission_keeps_hedge(client,positions):
+    client.place_order.return_value={"status":"failure"}
     with pytest.raises(ValueError): execution.close_open_fno_positions(client,positions)
     assert client.place_order.call_count==1
     assert client.place_order.call_args.kwargs["transaction_type"]=="BUY"

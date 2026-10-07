@@ -52,17 +52,17 @@ def test_cycle_shares_one_analysis(config,client,positions,analysis,monkeypatch,
     (entry if active else exit_).assert_not_called()
 
 
-@pytest.mark.parametrize("filled,remaining,result", [(False,False,1),(True,True,1),(True,False,0)])
-def test_reentry_requires_confirmed_flat_account(config,client,positions,analysis,monkeypatch,filled,remaining,result):
+@pytest.mark.parametrize("remaining", [True, False])
+def test_reentry_requires_flat_account(config,client,positions,analysis,monkeypatch,remaining):
     cfg=replace(config,dry_run=False,live_trading_enabled=True)
     monkeypatch.setattr(strategy,"spread_profit_target_reached",lambda *_: (True,{}))
     monkeypatch.setattr(strategy,"close_open_fno_positions",Mock(return_value=[{}]))
-    monkeypatch.setattr(strategy,"wait_for_exit_orders_traded",Mock(return_value=(filled,[])))
     client.get_positions.return_value={"data":positions if remaining else []}
     entry=Mock(return_value=0);monkeypatch.setattr(strategy,"entry_check",entry)
-    assert strategy.exit_check(cfg,client,positions,analysis=analysis)==result
-    if result==0: entry.assert_called_once_with(cfg,client,analysis=analysis,reentry=True)
+    assert strategy.exit_check(cfg,client,positions,analysis=analysis)==0
+    if not remaining: entry.assert_called_once_with(cfg,client,analysis=analysis,reentry=True)
     else: entry.assert_not_called()
+    client.get_order_by_id.assert_not_called()
 
 
 def test_scope_filters_entry_contracts(config,client,analysis,chain,monkeypatch):
