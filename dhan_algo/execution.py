@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Any
 from dhan_algo.audit import log_event
+from dhan_algo.positions import active_strategy_position, dhan_positions
 import time
 
 
@@ -118,7 +119,7 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
                 "fully_filled": fully_filled,
             }
             latest_statuses.append(record)
-            if status in {"REJECTED", "CANCELLED", "EXPIRED", "PART_TRADED"}:
+            if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
                 log_event(f"{phase}_ORDER_NOT_FULLY_TRADED", order_statuses=latest_statuses)
                 return False, latest_statuses
             if status != "TRADED" or not fully_filled:
@@ -135,3 +136,18 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
 def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
     """Confirm all exit orders before re-entry."""
     return wait_for_orders_traded(dhan, orders, phase="EXIT")
+
+
+def wait_for_strategy_flat(dhan: Any) -> tuple[bool, list[dict[str, Any]]]:
+    """Wait for the scoped positions endpoint to reflect the completed exit."""
+    deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
+    while True:
+        positions = dhan_positions(dhan)
+        if not active_strategy_position(positions):
+            log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
+            return True, positions
+        if time.monotonic() >= deadline:
+            log_event("EXIT_POSITION_CONFIRMATION_TIMED_OUT", remaining_positions=positions)
+            return False, positions
+        log_event("EXIT_WAITING_FOR_POSITION_UPDATE")
+        time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)

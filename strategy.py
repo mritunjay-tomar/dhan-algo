@@ -383,7 +383,7 @@ def entry_check(
         if not signal:
             print("No Supertrend direction is available. No spread proposed.")
             log_event("NO_ENTRY_SIGNAL", close=analysis.candles[-1]["close"], supertrend=analysis.supertrend_values[-1], candle_close_ist=analysis.candle_close_time.isoformat())
-            return 0
+            return 0 if config.dry_run or not config.live_trading_enabled else 1
 
         expiry_request = {"UnderlyingScrip": config.nifty_option_underlying_security_id, "UnderlyingSeg": segment}
         expiry = next_expiry(dhan_request("/optionchain/expirylist", client_id, token, expiry_request, config.request_timeout_seconds))
@@ -633,7 +633,7 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
                 "fully_filled": fully_filled,
             }
             latest_statuses.append(record)
-            if status in {"REJECTED", "CANCELLED", "EXPIRED", "PART_TRADED"}:
+            if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
                 log_event(f"{phase}_ORDER_NOT_FULLY_TRADED", order_statuses=latest_statuses)
                 return False, latest_statuses
             if status != "TRADED" or not fully_filled:
@@ -649,6 +649,21 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
 def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
     """Confirm all exit orders before re-entry."""
     return wait_for_orders_traded(dhan, orders, phase="EXIT")
+
+
+def wait_for_strategy_flat(dhan: Any) -> tuple[bool, list[dict[str, Any]]]:
+    """Wait for the positions endpoint to reflect the completed exit."""
+    deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
+    while True:
+        positions = dhan_positions(dhan)
+        if not active_strategy_position(positions):
+            log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
+            return True, positions
+        if time.monotonic() >= deadline
+            log_event("EXIT_POSITION_CONFIRMATION_TIMED_OUT", remaining_positions=positions)
+            return False, positions
+        log_event("EXIT_WAITING_FOR_POSITION_UPDATE")
+        time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
 
 
 def close_debit(chain: dict[str, Any], state: dict[str, Any]) -> float:
@@ -718,8 +733,8 @@ def exit_check(
         log_event("EXIT_REENTRY_SKIPPED", **output)
         return 1
 
-    remaining_positions = dhan_positions(dhan)
-    if active_strategy_position(remaining_positions):
+    flat, remaining_positions = wait_for_strategy_flat(dhan)
+    if not flat:
         output["remaining_positions"] = remaining_positions
         output["note"] = "Exit orders were filled, but active F&O positions remain; re-entry was skipped."
         print(json.dumps(output, indent=2, default=str))

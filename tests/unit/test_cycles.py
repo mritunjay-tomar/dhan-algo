@@ -3,6 +3,7 @@ from unittest.mock import Mock
 import itertools
 import pytest
 from dhan_algo.broker import DhanBroker
+from dhan_algo import execution
 from dhan_algo.strategies import credit_spread as strategy
 
 
@@ -56,13 +57,17 @@ def test_cycle_shares_one_analysis(config,client,positions,analysis,monkeypatch,
 def test_reentry_requires_flat_account(config,client,positions,analysis,monkeypatch,remaining):
     cfg=replace(config,dry_run=False,live_trading_enabled=True)
     monkeypatch.setattr(strategy,"spread_profit_target_reached",lambda *_: (True,{}))
-    monkeypatch.setattr(strategy,"close_open_fno_positions",Mock(return_value=[{}]))
+    monkeypatch.setattr(execution,"EXIT_ORDER_POLL_TIMEOUT_SECONDS",0)
+    orders = [{"security_id": str(p["securityId"]), "quantity": 25,
+               "response": {"status": "success", "data": {"orderId": str(i)}}}
+              for i,p in enumerate(positions)]
+    monkeypatch.setattr(strategy,"close_open_fno_positions",Mock(return_value=orders))
     client.get_positions.return_value={"data":positions if remaining else []}
     entry=Mock(return_value=0);monkeypatch.setattr(strategy,"entry_check",entry)
-    assert strategy.exit_check(cfg,client,positions,analysis=analysis)==0
+    assert strategy.exit_check(cfg,client,positions,analysis=analysis)==int(remaining)
     if not remaining: entry.assert_called_once_with(cfg,client,analysis=analysis,reentry=True)
     else: entry.assert_not_called()
-    client.get_order_by_id.assert_not_called()
+    assert client.get_order_by_id.call_count == 2
 
 
 def test_scope_filters_entry_contracts(config,client,analysis,chain,monkeypatch):

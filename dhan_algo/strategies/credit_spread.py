@@ -10,7 +10,8 @@ from dhan_algo.market import MarketAnalysis, analyse_market
 from dhan_algo.options import next_expiry, option_legs, spread_payoff
 from dhan_algo.positions import (dhan_positions, active_strategy_position, spread_profit_target_reached,
                                  opposite_supertrend_cross, bought_option_expiring_within_two_days)
-from dhan_algo.execution import place_credit_spread_entry, close_open_fno_positions
+from dhan_algo.execution import (place_credit_spread_entry, close_open_fno_positions,
+                                 wait_for_exit_orders_traded, wait_for_strategy_flat)
 from dhan_algo.strategies.base import Strategy
 
 
@@ -35,7 +36,7 @@ def entry_check(
         if not signal:
             print("No Supertrend direction is available. No spread proposed.")
             log_event("NO_ENTRY_SIGNAL", close=analysis.candles[-1]["close"], supertrend=analysis.supertrend_values[-1], candle_close_ist=analysis.candle_close_time.isoformat())
-            return 0
+            return 0 if config.dry_run or not config.live_trading_enabled else 1
 
         expiry_request = {"UnderlyingScrip": config.nifty_option_underlying_security_id, "UnderlyingSeg": segment}
         expiry = next_expiry(dhan_request("/optionchain/expirylist", client_id, token, expiry_request, config.request_timeout_seconds))
@@ -121,20 +122,27 @@ def exit_check(
         return 0
     try:
         output["orders"] = close_open_fno_positions(dhan, positions)
+        exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
+        output["exit_order_statuses"] = order_statuses
+        if not exit_confirmed:
+            output["note"] = "Exit orders are not confirmed fully filled; the cycle failed before re-entry."
+            print(json.dumps(output, indent=2, default=str))
+            log_event("EXIT_CONFIRMATION_FAILED", **output)
+            return 1
+        flat, remaining_positions = wait_for_strategy_flat(dhan)
     except Exception as error:
         output["order_error"] = str(error)
         print(json.dumps(output, indent=2, default=str))
         log_event("EXIT_ORDER_FAILURE", **output)
         return 1
-    remaining_positions = dhan_positions(dhan)
-    if active_strategy_position(remaining_positions):
+    if not flat:
         output["remaining_positions"] = remaining_positions
-        output["note"] = "Exit market orders submitted; positions not yet flat, re-entry deferred to next cycle."
+        output["note"] = "Exit fills confirmed, but positions did not update to flat before the timeout; cycle failed."
         print(json.dumps(output, indent=2, default=str))
-        log_event("EXIT_SUBMITTED_REENTRY_DEFERRED", **output)
-        return 0
+        log_event("EXIT_POSITION_CONFIRMATION_FAILED", **output)
+        return 1
 
-    output["note"] = "Exit market orders submitted and positions are flat; starting immediate re-entry."
+    output["note"] = "Exit orders filled and positions confirmed flat; starting immediate re-entry in this cycle."
     print(json.dumps(output, indent=2, default=str))
     log_event("EXIT_CONFIRMED_REENTRY_STARTED", **output)
     return entry_check(config, dhan, analysis=analysis, reentry=True)
