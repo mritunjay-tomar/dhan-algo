@@ -23,7 +23,8 @@ def test_entry_read_only_flags(config,client,analysis,chain,monkeypatch,directio
 
 
 @pytest.mark.parametrize("target,cross,expiry", list(itertools.product([False,True],repeat=3)))
-def test_exit_reason_combinations(config,client,positions,analysis,monkeypatch,caplog,target,cross,expiry):
+def test_exit_reason_combinations(config,client,positions,analysis,chain,monkeypatch,caplog,target,cross,expiry):
+    monkeypatch.setattr(strategy,"dhan_request",Mock(side_effect=[{"data":["2026-10-13","2026-10-20"]},chain]))
     monkeypatch.setattr(strategy,"spread_profit_target_reached",lambda *_: (target,{}))
     monkeypatch.setattr(strategy,"opposite_supertrend_cross",lambda *_:cross)
     monkeypatch.setattr(strategy,"bought_option_expiring_within_two_days",lambda *_:expiry)
@@ -101,7 +102,8 @@ def test_exit_submission_failure_blocks_reentry(config,client,positions,analysis
 
 
 @pytest.mark.parametrize("dry,enabled", [(True,False),(True,True),(False,False)])
-def test_actual_exit_target_read_only(config,client,positions,analysis,dry,enabled,caplog):
+def test_actual_exit_target_read_only(config,client,positions,analysis,chain,monkeypatch,dry,enabled,caplog):
+    monkeypatch.setattr(strategy,"dhan_request",Mock(side_effect=[{"data":["2026-10-13","2026-10-20"]},chain]))
     client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"]=76
     cfg=replace(config,dry_run=dry,live_trading_enabled=enabled)
     with caplog.at_level("INFO"):

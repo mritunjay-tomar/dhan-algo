@@ -3,6 +3,11 @@ from typing import Any
 
 
 def next_expiry(expiry_response: dict[str, Any]) -> str:
+    if not isinstance(expiry_response, dict) or expiry_response.get("status") == "failure":
+        raise ValueError("Invalid Dhan expiry-list response.")
+    values = expiry_response.get("data")
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError("Dhan expiry list must contain date strings.")
     expiries = sorted(expiry_response.get("data", []))
     if len(expiries) < 2:
         raise ValueError(f"Need at least two active expiries to select next week; received {expiries!r}")
@@ -17,7 +22,12 @@ def option_legs(
 
     if signal not in {"BULLISH", "BEARISH"}:
         raise ValueError("Unknown Supertrend direction.")
-    option_chain = chain_response.get("data", {}).get("oc", {})
+    if not isinstance(chain_response, dict) or chain_response.get("status") == "failure":
+        raise ValueError("Invalid Dhan option-chain response.")
+    data = chain_response.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("oc"), dict):
+        raise ValueError("Dhan option chain must contain a strike dictionary.")
+    option_chain = data["oc"]
 
     side, target_sell = (
         ("pe", -0.50)

@@ -27,9 +27,11 @@ Every cycle first reads the strategy's current NIFTY F&O positions.
 
 The entry direction does **not** require a new crossover. A close exactly equal to Supertrend is treated as bearish. Supertrend defaults to ATR period 22 and multiplier 4, using the prior 60 calendar days of 15-minute Dhan candles resampled into NSE-aligned, completed 30-minute candles.
 
-After submitting a live exit, the strategy actively waits for all exit orders to fill, then polls the scoped positions until Dhan reports the account flat. A stale first position snapshot does not defer entry to the next scheduled cycle. Once flat, it immediately evaluates and submits the next spread using the completed-candle Supertrend direction, without requiring a fresh crossover. A cycle starting flat also evaluates an entry immediately.
+After submitting a live exit, the strategy checks both order IDs five times at one-second intervals, then polls scoped positions as the final safety gate. Re-entry requires two consecutive flat position snapshots, so an unavailable or undocumented order-status response cannot create a false failure when the account is demonstrably flat, while one stale snapshot cannot trigger a premature entry. Once confirmed flat, it immediately evaluates and submits the next spread using the completed-candle Supertrend direction, without requiring a fresh crossover. A cycle starting flat also evaluates an entry immediately.
 
-Order confirmation and position-update confirmation each wait up to 30 seconds, polling every two seconds. Partial fills continue polling; rejected, cancelled or expired orders fail immediately. An unconfirmed exit or position-update timeout returns a nonzero cycle status and logs the reason. Missing market direction in live mode also returns failure instead of reporting a successful cycle with no entry. Broker rejections, unavailable data and confirmation timeouts can still prevent a trade; the runner reports these failures instead of treating them as normal successful deferrals.
+In dry-run mode, every triggered exit also evaluates a **hypothetical re-entry** using the current Supertrend direction and option-chain API reads. Logs show `DRY_RUN_EXIT_SIGNAL`, `DRY_RUN_REENTRY_STARTED`, and `DRY_RUN_REENTRY_SIGNAL`. Broker positions remain unchanged; there are no exit/entry order submissions or fill polls. If re-entry data is unavailable, the cycle reports failure instead of a successful proposal. The standalone Cloud script uses the same 50% combined spread-profit calculation and IST expiry-date boundaries as the modular runner.
+
+Order status is polled five times, one second apart. Transient SDK failures and malformed status payloads are retried and each attempt is audited; rejected, cancelled or expired orders stop order polling immediately. Whether order status succeeds or remains inconclusive, scoped positions must then be observed flat twice. Positions can update for up to 30 seconds before the cycle fails. Missing market direction in live mode also returns failure instead of reporting a successful cycle with no entry. Broker rejections, remaining exposure, unavailable data and confirmation timeouts can still prevent a trade; the runner reports these failures instead of treating them as normal successful deferrals.
 
 For an entry, the strategy sorts the active expiries returned by Dhan and selects the second one. It chooses the short option whose delta is closest to -0.50 for puts or +0.50 for calls. It chooses an out-of-the-money protective option whose premium is closest to half the short option premium. It will refuse to trade if Dhan has not provided valid contracts or executable bid/ask prices, or if the result is not a positive credit spread.
 
@@ -45,7 +47,7 @@ This is an illustrative example only; strikes, premiums, contract IDs and lot si
 4. With `NIFTY_QUANTITY=1` and `NIFTY_LOT_SIZE=25`, it trades 25 units of each leg. The estimated credit is `(₹100 − ₹52) × 25 = ₹1,200`. Spread width is `₹100 × 25 = ₹2,500`, so the estimated maximum loss is `(₹100 − ₹48) × 25 = ₹1,300` before brokerage, taxes and slippage.
 5. If the recorded sell average is ₹100 and the recorded protective-buy average is ₹52, maximum profit is `(₹100 − ₹52) × 25 = ₹1,200`. The profit exit triggers when the combined running P&L of both legs reaches ₹600 (50% of ₹1,200). A completed candle closing below Supertrend or approaching long-leg expiry also triggers the exit.
 
-In live mode the application submits the 24,900 protective put buy first and, once Dhan accepts that submission, immediately submits the 25,000 short-put sell. It does not wait for Dhan's order-status endpoint to report a fill between the two entry submissions. On exit it submits the short buyback before the protective-put sell, confirms both orders filled, then waits for the scoped position update before immediately re-entering. Partial exits continue polling until fully filled or timed out. Rejected, cancelled, expired or unconfirmed exits return failure.
+In live mode the application submits the 24,900 protective put buy first and, once Dhan accepts that submission, immediately submits the 25,000 short-put sell. It does not wait for Dhan's order-status endpoint to report a fill between the two entry submissions. On exit it submits the short buyback before the protective-put sell, polls both order IDs, then requires two consecutive scoped position reads showing no exposure before immediately re-entering. Rejected, cancelled or expired statuses stop order polling; inconclusive statuses can proceed only when positions independently confirm the strategy is flat.
 
 ## First run: beginner checklist
 
@@ -152,8 +154,8 @@ To add a different algorithm, subclass `Strategy` in `dhan_algo/strategies/`, im
 - Entry uses the current Supertrend direction, **without requiring a fresh crossover**: bullish → put credit spread; bearish → call credit spread. Equality to Supertrend remains bearish, matching the original rule.
 - Select the second listed expiry, short near absolute delta 0.50, and buy protection near half the short premium. Protection must now be on the correct out-of-the-money side. Reject missing contracts and invalid bid/ask credit payoffs.
 - Exit when the combined running spread profit reaches at least 50% of maximum credit profit, the latest completed candle is on the adverse side of Supertrend, or a long option expires in 0–2 calendar days. Dates use Asia/Kolkata. Missing/zero quotes do not count as profit targets.
-- Submit the protective buy before the short sell, without waiting for entry fill confirmation. On exit, close and confirm the short before releasing protection. A rejected entry submission, or an incomplete exit, stops the remaining legs.
-- Re-entry requires fully traded exit orders and a fresh scoped position read showing no active positions. Pending orders are not automatically cancelled; after execution errors, reconcile orders/positions before retrying. There is no persistent order reconciliation service in this project.
+- Submit the protective buy before the short sell, without waiting for entry fill confirmation. On exit, submit the short close before releasing protection. A rejected entry submission stops the remaining entry legs.
+- Re-entry requires two consecutive scoped position reads showing no active positions. Order IDs are checked five times first, but an inconclusive status payload can fall back to the stronger flat-position safety check. Pending orders are not automatically cancelled; after execution errors, reconcile orders/positions before retrying. There is no persistent order reconciliation service in this project.
 - Dry runs report entry/exit intent without submitting or simulating fills. They do not create persistent paper positions or claim that live execution succeeded.
 
 ## Tests
@@ -164,6 +166,27 @@ To add a different algorithm, subclass `Strategy` in `dhan_algo/strategies/`, im
 ```
 
 The default suite uses deterministic Dhan-shaped fixtures and prohibits network access. It covers both entry directions, expiry and contract selection, credit payoff validation, quantity conversion, crossover/equality boundaries, all eight exit-reason combinations, spread-level profit targets, expiry day boundaries, malformed responses, every trading-flag combination, fill ordering, partial/rejected/cancelled/expired/pending orders, timeouts, re-entry gates, and multi-strategy isolation/failure handling. Order-lifecycle tests exercise execution against fakes, never the real broker.
+
+### API-driven dry-run scenarios
+
+Run the detailed suite without credentials or network access:
+
+```powershell
+python -m pytest tests/unit/test_api_dry_run.py -q
+```
+
+These tests exercise both the modular runner and standalone Cloud script. Only SDK response methods and HTTP/TLS transport are mocked. The real candle parsing, pandas-ta Supertrend, position checks, profit calculations, expiry checks, option selection and re-entry decisions execute. A fixed IST clock makes expiry boundaries reproducible.
+
+| API boundary | Response cases and assertions |
+| --- | --- |
+| Positions | Active spreads, empty accounts, zero-quantity closed records, SDK-wrapped and raw lists, `netQty`/`netQuantity`, malformed responses, scoped manual positions. |
+| Ticker | Both-leg spread P&L at, below and above 50% of maximum credit; missing/invalid quotes; nested/direct SDK data wrappers; numeric/dictionary quotes; failures. |
+| Intraday candles | Actual bullish and bearish Supertrend crossovers, hold conditions, raw/data-wrapped candles, missing columns, null responses and invalid JSON. |
+| Expiry list | Valid next expiry, empty/single-expiry lists, null/invalid response structures, invalid JSON. Long-option expiry boundaries cover yesterday, today, tomorrow, two days and three days away. |
+| Option chain | Selected put/call legs and quantity for hypothetical re-entry, empty/null/malformed chains, invalid JSON. |
+| HTTP failures | 401, 429, 503 and connection failures at every HTTP read endpoint used in a cycle. |
+
+The exit matrix covers all eight combinations of profit target, opposite Supertrend direction and expiry triggers, for put/call spreads and both values of the live-trading flag while `dry_run=True`. Every proposed exit must have exactly one proposed re-entry; repeated cycles verify this separately for each exit reason. Every case asserts that order submission and order-status polling remain unused. Existing execution tests cover mocked pending, partial, filled, rejected, cancelled and expired order responses and delayed position updates.
 
 To exercise **actual Dhan APIs in application dry-run mode**, export credentials and lot size, then run:
 

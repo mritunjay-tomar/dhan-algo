@@ -13,18 +13,15 @@ from dhan_algo.strategies import credit_spread
 def test_waits_for_stale_positions_then_reenters_same_cycle(module, config, client, positions,
                                                           analysis, monkeypatch):
     cfg = replace(config, dry_run=False, live_trading_enabled=True)
-    if module is credit_spread:
-        monkeypatch.setattr(module, "spread_profit_target_reached", lambda *_: (True, {}))
-    else:
-        monkeypatch.setattr(module, "short_legs_at_half_price", lambda *_: (True, []))
+    monkeypatch.setattr(module, "spread_profit_target_reached", lambda *_: (True, {}))
     clock_module = execution if module is credit_spread else standalone
     monkeypatch.setattr(clock_module.time, "sleep", lambda _: None)
-    client.get_positions.side_effect = [{"data": positions}, {"data": positions}, {"data": []}]
+    client.get_positions.side_effect = [{"data": positions}, {"data": positions}, {"data": []}, {"data": []}]
     entry = Mock(return_value=0)
     monkeypatch.setattr(module, "entry_check", entry)
 
     assert module.exit_check(cfg, client, positions, analysis=analysis) == 0
-    assert client.get_positions.call_count == 3
+    assert client.get_positions.call_count == 4
     assert client.place_order.call_count == 2
     assert client.get_order_by_id.call_count == 2
     entry.assert_called_once_with(cfg, client, analysis=analysis, reentry=True)
@@ -42,7 +39,7 @@ def test_exit_followed_by_both_new_entry_orders(config, client, positions, analy
     monkeypatch.setattr(credit_spread, "dhan_request", Mock(side_effect=[
         {"data": ["2026-10-06", "2026-10-13"]}, chain,
     ]))
-    client.get_positions.side_effect = [{"data": positions}, {"data": []}]
+    client.get_positions.side_effect = [{"data": positions}, {"data": []}, {"data": []}]
     assert credit_spread.exit_check(cfg, DhanBroker(client, cfg), positions, analysis=analysis) == 0
     assert [(c.kwargs["security_id"], c.kwargs["transaction_type"])
             for c in client.place_order.call_args_list] == [
@@ -69,15 +66,33 @@ def test_partial_exit_eventually_fills_instead_of_aborting(module, client, monke
 def test_unfinished_or_failed_exit_is_an_error_and_does_not_duplicate_orders(status, config, client,
                                                                           positions, analysis, monkeypatch):
     cfg = replace(config, dry_run=False, live_trading_enabled=True)
+    monkeypatch.setattr(execution, "EXIT_ORDER_POLL_ATTEMPTS", 1)
     monkeypatch.setattr(execution, "EXIT_ORDER_POLL_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(credit_spread, "spread_profit_target_reached", lambda *_: (True, {}))
     client.get_order_by_id.return_value = {"data": {"orderStatus": status, "filledQty": 10}}
+    client.get_positions.return_value = {"data": positions}
     entry = Mock()
     monkeypatch.setattr(credit_spread, "entry_check", entry)
     assert credit_spread.exit_check(cfg, client, positions, analysis=analysis) == 1
     entry.assert_not_called()
     assert client.place_order.call_count == 2
-    client.get_positions.assert_not_called()
+    client.get_positions.assert_called_once()
+
+
+def test_inconclusive_order_status_reenters_only_after_two_flat_reads(config, client, positions,
+                                                                     analysis, monkeypatch):
+    cfg = replace(config, dry_run=False, live_trading_enabled=True)
+    monkeypatch.setattr(execution.time, "sleep", lambda _: None)
+    monkeypatch.setattr(credit_spread, "spread_profit_target_reached", lambda *_: (True, {}))
+    client.get_order_by_id.return_value = {"status": "success", "data": {}}
+    client.get_positions.side_effect = [{"data": []}, {"data": []}]
+    entry = Mock(return_value=0)
+    monkeypatch.setattr(credit_spread, "entry_check", entry)
+
+    assert credit_spread.exit_check(cfg, client, positions, analysis=analysis) == 0
+    assert client.get_order_by_id.call_count == 10
+    assert client.get_positions.call_count == 2
+    entry.assert_called_once_with(cfg, client, analysis=analysis, reentry=True)
 
 
 def test_flat_cycle_enters_without_waiting_for_a_new_crossover(config, client, analysis, chain, monkeypatch):

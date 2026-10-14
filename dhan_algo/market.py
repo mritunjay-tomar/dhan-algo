@@ -24,6 +24,8 @@ class MarketAnalysis:
 
 def candle_rows(response: dict[str, Any]) -> list[dict[str, float]]:
     """Convert Dhan's column-oriented historical response into candle rows."""
+    if not isinstance(response, dict):
+        raise ValueError("Historical API response must be a JSON object.")
     data = response.get("data", response)
     required = ("open", "high", "low", "close")
     if not isinstance(data, dict) or any(not isinstance(data.get(k), list) for k in required):

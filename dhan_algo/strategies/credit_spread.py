@@ -116,19 +116,17 @@ def exit_check(
         log_event("NO_EXIT_SIGNAL", **output)
         return 0
     if not config.live_trading_enabled or config.dry_run:
-        output["note"] = "Exit condition met, but live trading is disabled or dry run is enabled."
+        output["note"] = "Dry-run exit proposed; evaluating a hypothetical re-entry without changing broker positions."
         print(json.dumps(output, indent=2))
         log_event("DRY_RUN_EXIT_SIGNAL", **output)
-        return 0
+        log_event("DRY_RUN_REENTRY_STARTED", simulated_exit=True, position_count=len(positions))
+        return entry_check(config, dhan, analysis=analysis, reentry=True)
     try:
         output["orders"] = close_open_fno_positions(dhan, positions)
         exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
         output["exit_order_statuses"] = order_statuses
         if not exit_confirmed:
-            output["note"] = "Exit orders are not confirmed fully filled; the cycle failed before re-entry."
-            print(json.dumps(output, indent=2, default=str))
-            log_event("EXIT_CONFIRMATION_FAILED", **output)
-            return 1
+            log_event("EXIT_ORDER_STATUS_INCONCLUSIVE", order_statuses=order_statuses)
         flat, remaining_positions = wait_for_strategy_flat(dhan)
     except Exception as error:
         output["order_error"] = str(error)
@@ -137,14 +135,17 @@ def exit_check(
         return 1
     if not flat:
         output["remaining_positions"] = remaining_positions
-        output["note"] = "Exit fills confirmed, but positions did not update to flat before the timeout; cycle failed."
+        output["note"] = "Exit could not be confirmed flat after order-status and position polling; cycle failed before re-entry."
         print(json.dumps(output, indent=2, default=str))
         log_event("EXIT_POSITION_CONFIRMATION_FAILED", **output)
         return 1
 
-    output["note"] = "Exit orders filled and positions confirmed flat; starting immediate re-entry in this cycle."
+    if exit_confirmed:
+        output["note"] = "Exit orders filled and positions confirmed flat twice; starting immediate re-entry in this cycle."
+    else:
+        output["note"] = "Order-status responses remained inconclusive, but positions were confirmed flat twice; starting immediate re-entry safely."
     print(json.dumps(output, indent=2, default=str))
-    log_event("EXIT_CONFIRMED_REENTRY_STARTED", **output)
+    log_event("EXIT_CONFIRMED_REENTRY_STARTED", confirmation_source="orders_and_positions" if exit_confirmed else "positions_fallback", **output)
     return entry_check(config, dhan, analysis=analysis, reentry=True)
 
 

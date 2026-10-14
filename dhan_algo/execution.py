@@ -5,8 +5,10 @@ from dhan_algo.positions import active_strategy_position, dhan_positions
 import time
 
 
-EXIT_ORDER_POLL_INTERVAL_SECONDS = 2.0
+EXIT_ORDER_POLL_INTERVAL_SECONDS = 1.0
+EXIT_ORDER_POLL_ATTEMPTS = 5
 EXIT_ORDER_POLL_TIMEOUT_SECONDS = 30.0
+EXIT_FLAT_CONFIRMATIONS_REQUIRED = 2
 
 def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> list[dict[str, Any]]:
     """Submit the protective buy, then immediately submit the short sell.
@@ -72,10 +74,29 @@ def close_open_fno_positions(dhan: Any, positions: list[dict[str, Any]]) -> list
     return responses
 
 
-def order_details(response: dict[str, Any]) -> dict[str, Any]:
-    """Return the Dhan order payload from either SDK response shape."""
-    data = response.get("data", response) if isinstance(response, dict) else {}
-    return data if isinstance(data, dict) else {}
+def order_details(response: dict[str, Any], order_id: str | None = None) -> dict[str, Any]:
+    """Return order details from direct, SDK-wrapped, or single-item list responses."""
+    value: Any = response
+    for _ in range(3):
+        if isinstance(value, dict):
+            if any(key in value for key in ("orderStatus", "order_status", "filledQty", "filled_qty")):
+                return value
+            if "data" not in value:
+                return value
+            value = value["data"]
+            continue
+        if isinstance(value, list):
+            candidates = [item for item in value if isinstance(item, dict)]
+            if order_id is not None:
+                match = next((item for item in candidates if str(item.get("orderId", item.get("order_id", ""))) == order_id), None)
+                if match is not None:
+                    value = match
+                    continue
+            if len(candidates) == 1:
+                value = candidates[0]
+                continue
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: str) -> tuple[bool, list[dict[str, Any]]]:
@@ -86,26 +107,25 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
     for order in orders:
         response = order.get("response")
         payload = order_details(response) if isinstance(response, dict) else {}
-        order_id = payload.get("orderId")
+        order_id = payload.get("orderId", payload.get("order_id"))
         if (not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure"
                 or not isinstance(order_id, (str, int)) or not str(order_id)):
             log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", security_id=order.get("security_id"), response=response)
             return False, tracked
         tracked.append({**order, "order_id": str(order_id)})
 
-    deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
     latest_statuses: list[dict[str, Any]] = []
-    while True:
+    for attempt in range(1, EXIT_ORDER_POLL_ATTEMPTS + 1):
         latest_statuses = []
         all_traded = True
         for order in tracked:
-            status_response = dhan.get_order_by_id(order["order_id"])
-            if not isinstance(status_response, dict) or str(status_response.get("status", "")).lower() == "failure":
-                log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", order_id=order["order_id"], response=status_response)
-                return False, latest_statuses
-            payload = order_details(status_response)
-            status = str(payload.get("orderStatus", "")).upper()
-            filled_quantity = payload.get("filledQty")
+            try:
+                status_response = dhan.get_order_by_id(order["order_id"])
+            except Exception as error:
+                status_response = {"status": "failure", "remarks": str(error)}
+            payload = order_details(status_response, order["order_id"]) if isinstance(status_response, dict) else {}
+            status = str(payload.get("orderStatus", payload.get("order_status", ""))).upper()
+            filled_quantity = payload.get("filledQty", payload.get("filled_qty"))
             try:
                 fully_filled = float(filled_quantity) >= float(order["quantity"])
             except (TypeError, ValueError):
@@ -117,6 +137,11 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
                 "filled_quantity": filled_quantity,
                 "expected_quantity": order["quantity"],
                 "fully_filled": fully_filled,
+                "response_status": status_response.get("status") if isinstance(status_response, dict) else None,
+                "response_data_type": type(status_response.get("data")).__name__ if isinstance(status_response, dict) and "data" in status_response else type(status_response).__name__,
+                "response_keys": sorted(str(key) for key in status_response) if isinstance(status_response, dict) else [],
+                "payload_keys": sorted(str(key) for key in payload),
+                "response_remarks": status_response.get("remarks") if isinstance(status_response, dict) else None,
             }
             latest_statuses.append(record)
             if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
@@ -124,13 +149,14 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
                 return False, latest_statuses
             if status != "TRADED" or not fully_filled:
                 all_traded = False
+        log_event(f"{phase}_ORDER_POLL_ATTEMPT", attempt=attempt, maximum_attempts=EXIT_ORDER_POLL_ATTEMPTS, order_statuses=latest_statuses)
         if all_traded:
             log_event(f"{phase}_ORDERS_CONFIRMED_TRADED", order_statuses=latest_statuses)
             return True, latest_statuses
-        if time.monotonic() >= deadline:
-            log_event(f"{phase}_ORDER_CONFIRMATION_TIMED_OUT", order_statuses=latest_statuses)
-            return False, latest_statuses
-        time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
+        if attempt < EXIT_ORDER_POLL_ATTEMPTS:
+            time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
+    log_event(f"{phase}_ORDER_CONFIRMATION_EXHAUSTED", attempts=EXIT_ORDER_POLL_ATTEMPTS, order_statuses=latest_statuses)
+    return False, latest_statuses
 
 
 def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
@@ -139,14 +165,22 @@ def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tupl
 
 
 def wait_for_strategy_flat(dhan: Any) -> tuple[bool, list[dict[str, Any]]]:
-    """Wait for the scoped positions endpoint to reflect the completed exit."""
+    """Require consecutive scoped position reads showing the strategy is flat."""
     deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
+    consecutive_flat = 0
     while True:
         positions = dhan_positions(dhan)
         if not active_strategy_position(positions):
-            log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
-            return True, positions
-        if time.monotonic() >= deadline:
+            consecutive_flat += 1
+            log_event("EXIT_FLAT_POSITION_OBSERVED", consecutive_confirmations=consecutive_flat, required_confirmations=EXIT_FLAT_CONFIRMATIONS_REQUIRED)
+            if consecutive_flat >= EXIT_FLAT_CONFIRMATIONS_REQUIRED:
+                log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
+                return True, positions
+        else:
+            consecutive_flat = 0
+        # Once the first flat snapshot arrives, always allow the confirming
+        # read even if it lands on the timeout boundary.
+        if time.monotonic() >= deadline and consecutive_flat == 0:
             log_event("EXIT_POSITION_CONFIRMATION_TIMED_OUT", remaining_positions=positions)
             return False, positions
         log_event("EXIT_WAITING_FOR_POSITION_UPDATE")

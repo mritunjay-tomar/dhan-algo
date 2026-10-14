@@ -33,8 +33,10 @@ import pandas_ta as ta
 
 
 API_BASE_URL = "https://api.dhan.co/v2"
-EXIT_ORDER_POLL_INTERVAL_SECONDS = 2.0
+EXIT_ORDER_POLL_INTERVAL_SECONDS = 1.0
+EXIT_ORDER_POLL_ATTEMPTS = 5
 EXIT_ORDER_POLL_TIMEOUT_SECONDS = 30.0
+EXIT_FLAT_CONFIRMATIONS_REQUIRED = 2
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,8 @@ def dhan_request(path: str, client_id: str, token: str, body: dict[str, Any], ti
 
 def candle_rows(response: dict[str, Any]) -> list[dict[str, float]]:
     """Convert Dhan's column-oriented historical response into candle rows."""
+    if not isinstance(response, dict):
+        raise ValueError("Historical API response must be a JSON object.")
     data = response.get("data", response)
     required = ("open", "high", "low", "close")
     if not isinstance(data, dict) or any(not isinstance(data.get(k), list) for k in required):
@@ -252,6 +256,11 @@ def analyse_market(config: StrategyConfig) -> MarketAnalysis:
 
 
 def next_expiry(expiry_response: dict[str, Any]) -> str:
+    if not isinstance(expiry_response, dict) or expiry_response.get("status") == "failure":
+        raise ValueError("Invalid Dhan expiry-list response.")
+    values = expiry_response.get("data")
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError("Dhan expiry list must contain date strings.")
     expiries = sorted(expiry_response.get("data", []))
     if len(expiries) < 2:
         raise ValueError(f"Need at least two active expiries to select next week; received {expiries!r}")
@@ -264,7 +273,14 @@ def option_legs(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return sell Δ0.50 and protective buy whose premium is ~50% of sell premium."""
 
-    option_chain = chain_response.get("data", {}).get("oc", {})
+    if signal not in {"BULLISH", "BEARISH"}:
+        raise ValueError("Unknown Supertrend direction.")
+    if not isinstance(chain_response, dict) or chain_response.get("status") == "failure":
+        raise ValueError("Invalid Dhan option-chain response.")
+    data = chain_response.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("oc"), dict):
+        raise ValueError("Dhan option chain must contain a strike dictionary.")
+    option_chain = data["oc"]
 
     side, target_sell = (
         ("pe", -0.50)
@@ -283,6 +299,7 @@ def option_legs(
         if (
             isinstance(delta, (int, float))
             and isinstance(last_price, (int, float))
+            and last_price > 0
             and leg.get("security_id")
         ):
             candidates.append({
@@ -309,8 +326,13 @@ def option_legs(
     target_buy_price = sell["last_price"] * 0.50
 
     # Buy leg: premium closest to half of sell premium
+    protective = [leg for leg in candidates if
+                  (signal == "BULLISH" and leg["strike"] < sell["strike"])
+                  or (signal == "BEARISH" and leg["strike"] > sell["strike"])]
+    if not protective:
+        raise ValueError("No out-of-the-money protective contract is available.")
     buy = min(
-        candidates,
+        protective,
         key=lambda item: abs(item["last_price"] - target_buy_price)
     )
 
@@ -430,10 +452,14 @@ def dhan_positions(dhan: Any) -> list[dict[str, Any]]:
     # Dhan API versions may return either a list directly or wrap it in a data
     # field. Reject any other response shape instead of iterating dictionary
     # keys and accidentally treating a malformed response as a position list.
+    if isinstance(payload, dict) and str(payload.get("status", "")).lower() == "failure":
+        raise ValueError("Dhan positions request failed.")
     positions = payload.get("data", payload) if isinstance(payload, dict) else payload
     if not isinstance(positions, list):
         raise ValueError("Unexpected positions response from Dhan.")
-    result = [position for position in positions if isinstance(position, dict)]
+    if any(not isinstance(position, dict) for position in positions):
+        raise ValueError("Malformed position in Dhan response.")
+    result = positions
     log_event("POSITIONS_FETCHED", total_positions=len(result), active_fno_positions=sum(1 for position in result if str(position.get("exchangeSegment")) == "NSE_FNO" and float(position.get("netQty", position.get("netQuantity", 0)) or 0) != 0))
     return result
 
@@ -471,7 +497,13 @@ def ltp_by_security_id(dhan: Any, positions: list[dict[str, Any]]) -> dict[str, 
     security_ids = [int(position["securityId"]) for position in positions]
     log_event("LTP_REQUEST", exchange_segment="NSE_FNO", security_ids=security_ids)
     payload = dhan.ticker_data({"NSE_FNO": security_ids})
-    segment_data = payload.get("data").get("data").get("NSE_FNO")
+    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() == "failure":
+        raise ValueError("Dhan ticker request failed.")
+    data = payload.get("data", {})
+    data = data.get("data", data) if isinstance(data, dict) else {}
+    segment_data = data.get("NSE_FNO") if isinstance(data, dict) else None
+    if not isinstance(segment_data, dict):
+        raise ValueError("Unexpected Dhan ticker response.")
     prices: dict[str, float] = {}
     if isinstance(segment_data, dict):
         for security_id, quote in segment_data.items():
@@ -483,6 +515,74 @@ def ltp_by_security_id(dhan: Any, positions: list[dict[str, Any]]) -> dict[str, 
                 prices[str(security_id)] = float(quote)
     log_event("LTP_RESPONSE", response_keys=sorted(payload) if isinstance(payload, dict) else [], prices_found=list(prices))
     return prices
+
+
+def spread_profit_target_reached(
+    dhan: Any,
+    positions: list[dict[str, Any]],
+    lots: int,
+    lot_size: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Return whether running spread profit has reached 50% of maximum credit."""
+    live_options = [
+        position for position in positions
+        if str(position.get("exchangeSegment")) == "NSE_FNO"
+        and str(position.get("drvOptionType", "")).upper() in {"CALL", "PUT"}
+        and float(position.get("netQty", position.get("netQuantity", 0)) or 0) != 0
+    ]
+    short_legs = [position for position in live_options if float(position.get("netQty", position.get("netQuantity", 0)) or 0) < 0]
+    long_legs = [position for position in live_options if float(position.get("netQty", position.get("netQuantity", 0)) or 0) > 0]
+    check: dict[str, Any] = {
+        "lots": lots,
+        "lot_size": lot_size,
+        "quantity": lots * lot_size,
+        "target_fraction": 0.5,
+        "calculable": False,
+        "target_reached": False,
+    }
+    if len(short_legs) != 1 or len(long_legs) != 1:
+        check["reason"] = "Expected exactly one live short option and one live long option."
+        return False, check
+
+    short_leg, long_leg = short_legs[0], long_legs[0]
+    sell_average = short_leg.get("sellAvg")
+    buy_average = long_leg.get("buyAvg")
+    if not isinstance(sell_average, (int, float)) or not isinstance(buy_average, (int, float)):
+        check["reason"] = "Dhan positions are missing the sell or buy entry average."
+        return False, check
+
+    sell_average, buy_average = float(sell_average), float(buy_average)
+    quantity = lots * lot_size
+    maximum_profit = (sell_average - buy_average) * quantity
+    if sell_average <= 0 or buy_average < 0 or maximum_profit <= 0:
+        check["reason"] = "Position averages do not describe a positive-credit spread."
+        return False, check
+
+    prices = ltp_by_security_id(dhan, [short_leg, long_leg])
+    short_ltp = prices.get(str(short_leg["securityId"]))
+    long_ltp = prices.get(str(long_leg["securityId"]))
+    check.update({
+        "short_security_id": str(short_leg["securityId"]),
+        "long_security_id": str(long_leg["securityId"]),
+        "short_sell_average": sell_average,
+        "long_buy_average": buy_average,
+        "short_ltp": short_ltp,
+        "long_ltp": long_ltp,
+        "maximum_profit": maximum_profit,
+        "profit_booking_amount": maximum_profit * 0.5,
+    })
+    if short_ltp is None or long_ltp is None or short_ltp <= 0 or long_ltp <= 0:
+        check["reason"] = "A valid current LTP is unavailable for one or both spread legs."
+        return False, check
+
+    running_profit = ((sell_average - short_ltp) + (long_ltp - buy_average)) * quantity
+    check.update({
+        "running_profit": running_profit,
+        "calculable": True,
+        "target_reached": running_profit >= check["profit_booking_amount"],
+    })
+    return bool(check["target_reached"]), check
+
 
 
 def short_legs_at_half_price(dhan: Any, positions: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
@@ -548,7 +648,7 @@ def bought_option_expiring_within_two_days(positions: list[dict[str, Any]]) -> b
             continue
         raw_expiry = str(position.get("drvExpiryDate", "")).split("T", 1)[0]
         try:
-            days_remaining = (date.fromisoformat(raw_expiry) - date.today()).days
+            days_remaining = (date.fromisoformat(raw_expiry) - datetime.now(ZoneInfo("Asia/Kolkata")).date()).days
         except ValueError:
             continue
         if 0 <= days_remaining <= 2:
@@ -588,10 +688,29 @@ def close_open_fno_positions(dhan: Any, positions: list[dict[str, Any]]) -> list
     return responses
 
 
-def order_details(response: dict[str, Any]) -> dict[str, Any]:
-    """Return the Dhan order payload from either SDK response shape."""
-    data = response.get("data", response) if isinstance(response, dict) else {}
-    return data if isinstance(data, dict) else {}
+def order_details(response: dict[str, Any], order_id: str | None = None) -> dict[str, Any]:
+    """Return order details from direct, SDK-wrapped, or single-item list responses."""
+    value: Any = response
+    for _ in range(3):
+        if isinstance(value, dict):
+            if any(key in value for key in ("orderStatus", "order_status", "filledQty", "filled_qty")):
+                return value
+            if "data" not in value:
+                return value
+            value = value["data"]
+            continue
+        if isinstance(value, list):
+            candidates = [item for item in value if isinstance(item, dict)]
+            if order_id is not None:
+                match = next((item for item in candidates if str(item.get("orderId", item.get("order_id", ""))) == order_id), None)
+                if match is not None:
+                    value = match
+                    continue
+            if len(candidates) == 1:
+                value = candidates[0]
+                continue
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: str) -> tuple[bool, list[dict[str, Any]]]:
@@ -600,26 +719,25 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
     for order in orders:
         response = order.get("response")
         payload = order_details(response) if isinstance(response, dict) else {}
-        order_id = payload.get("orderId")
+        order_id = payload.get("orderId", payload.get("order_id"))
         if (not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure"
                 or not isinstance(order_id, (str, int)) or not str(order_id)):
             log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", security_id=order.get("security_id"), response=response)
             return False, tracked
         tracked.append({**order, "order_id": str(order_id)})
 
-    deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
     latest_statuses: list[dict[str, Any]] = []
-    while True:
+    for attempt in range(1, EXIT_ORDER_POLL_ATTEMPTS + 1):
         latest_statuses = []
         all_traded = True
         for order in tracked:
-            status_response = dhan.get_order_by_id(order["order_id"])
-            if not isinstance(status_response, dict) or str(status_response.get("status", "")).lower() == "failure":
-                log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", order_id=order["order_id"], response=status_response)
-                return False, latest_statuses
-            payload = order_details(status_response)
-            status = str(payload.get("orderStatus", "")).upper()
-            filled_quantity = payload.get("filledQty")
+            try:
+                status_response = dhan.get_order_by_id(order["order_id"])
+            except Exception as error:
+                status_response = {"status": "failure", "remarks": str(error)}
+            payload = order_details(status_response, order["order_id"]) if isinstance(status_response, dict) else {}
+            status = str(payload.get("orderStatus", payload.get("order_status", ""))).upper()
+            filled_quantity = payload.get("filledQty", payload.get("filled_qty"))
             try:
                 fully_filled = float(filled_quantity) >= float(order["quantity"])
             except (TypeError, ValueError):
@@ -631,6 +749,11 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
                 "filled_quantity": filled_quantity,
                 "expected_quantity": order["quantity"],
                 "fully_filled": fully_filled,
+                "response_status": status_response.get("status") if isinstance(status_response, dict) else None,
+                "response_data_type": type(status_response.get("data")).__name__ if isinstance(status_response, dict) and "data" in status_response else type(status_response).__name__,
+                "response_keys": sorted(str(key) for key in status_response) if isinstance(status_response, dict) else [],
+                "payload_keys": sorted(str(key) for key in payload),
+                "response_remarks": status_response.get("remarks") if isinstance(status_response, dict) else None,
             }
             latest_statuses.append(record)
             if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
@@ -638,13 +761,14 @@ def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: st
                 return False, latest_statuses
             if status != "TRADED" or not fully_filled:
                 all_traded = False
+        log_event(f"{phase}_ORDER_POLL_ATTEMPT", attempt=attempt, maximum_attempts=EXIT_ORDER_POLL_ATTEMPTS, order_statuses=latest_statuses)
         if all_traded:
             log_event(f"{phase}_ORDERS_CONFIRMED_TRADED", order_statuses=latest_statuses)
             return True, latest_statuses
-        if time.monotonic() >= deadline:
-            log_event(f"{phase}_ORDER_CONFIRMATION_TIMED_OUT", order_statuses=latest_statuses)
-            return False, latest_statuses
-        time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
+        if attempt < EXIT_ORDER_POLL_ATTEMPTS:
+            time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
+    log_event(f"{phase}_ORDER_CONFIRMATION_EXHAUSTED", attempts=EXIT_ORDER_POLL_ATTEMPTS, order_statuses=latest_statuses)
+    return False, latest_statuses
 
 def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
     """Confirm all exit orders before re-entry."""
@@ -652,14 +776,22 @@ def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tupl
 
 
 def wait_for_strategy_flat(dhan: Any) -> tuple[bool, list[dict[str, Any]]]:
-    """Wait for the positions endpoint to reflect the completed exit."""
+    """Require consecutive position reads showing the account is flat."""
     deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
+    consecutive_flat = 0
     while True:
         positions = dhan_positions(dhan)
         if not active_strategy_position(positions):
-            log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
-            return True, positions
-        if time.monotonic() >= deadline
+            consecutive_flat += 1
+            log_event("EXIT_FLAT_POSITION_OBSERVED", consecutive_confirmations=consecutive_flat, required_confirmations=EXIT_FLAT_CONFIRMATIONS_REQUIRED)
+            if consecutive_flat >= EXIT_FLAT_CONFIRMATIONS_REQUIRED:
+                log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
+                return True, positions
+        else:
+            consecutive_flat = 0
+        # Once the first flat snapshot arrives, always allow the confirming
+        # read even if it lands on the timeout boundary.
+        if time.monotonic() >= deadline and consecutive_flat == 0:
             log_event("EXIT_POSITION_CONFIRMATION_TIMED_OUT", remaining_positions=positions)
             return False, positions
         log_event("EXIT_WAITING_FOR_POSITION_UPDATE")
@@ -691,21 +823,23 @@ def exit_check(
 ) -> int:
     config.validate()
     analysis = analysis or analyse_market(config)
-    target_reached, short_leg_checks = short_legs_at_half_price(dhan, positions)
+    target_reached, profit_check = spread_profit_target_reached(
+        dhan, positions, config.nifty_quantity, config.nifty_lot_size
+    )
     opposite_cross = opposite_supertrend_cross(analysis, positions)
     expiry_within_two_days = bought_option_expiring_within_two_days(positions)
     reasons: list[str] = []
     if target_reached:
-        reasons.append("ALL_SHORT_LEGS_AT_OR_BELOW_HALF_PRICE_WITH_5_PERCENT_TOLERANCE")
+        reasons.append("RUNNING_PROFIT_AT_OR_ABOVE_50_PERCENT_OF_MAXIMUM_PROFIT")
     if opposite_cross:
         reasons.append("OPPOSITE_30_MINUTE_SUPERTREND_CROSS")
     if expiry_within_two_days:
         reasons.append("LONG_OPTION_EXPIRY_WITHIN_TWO_DAYS")
-    log_event("EXIT_CONDITIONS_EVALUATED", target_reached=target_reached, opposite_supertrend_cross=opposite_cross, long_option_expiry_within_two_days=expiry_within_two_days, reasons=reasons, short_leg_checks=short_leg_checks)
+    log_event("EXIT_CONDITIONS_EVALUATED", target_reached=target_reached, opposite_supertrend_cross=opposite_cross, long_option_expiry_within_two_days=expiry_within_two_days, reasons=reasons, profit_check=profit_check)
     output: dict[str, Any] = {
         "exit_required": bool(reasons),
         "reasons": reasons,
-        "short_leg_checks": short_leg_checks,
+        "profit_check": profit_check,
         "current_positions": positions,
     }
     if not reasons:
@@ -714,10 +848,11 @@ def exit_check(
         log_event("NO_EXIT_SIGNAL", **output)
         return 0
     if not config.live_trading_enabled or config.dry_run:
-        output["note"] = "Exit condition met, but live trading is disabled or dry run is enabled."
+        output["note"] = "Dry-run exit proposed; evaluating a hypothetical re-entry without changing broker positions."
         print(json.dumps(output, indent=2))
         log_event("DRY_RUN_EXIT_SIGNAL", **output)
-        return 0
+        log_event("DRY_RUN_REENTRY_STARTED", simulated_exit=True, position_count=len(positions))
+        return entry_check(config, dhan, analysis=analysis, reentry=True)
     try:
         output["orders"] = close_open_fno_positions(dhan, positions)
     except Exception as error:
@@ -728,22 +863,22 @@ def exit_check(
     exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
     output["exit_order_statuses"] = order_statuses
     if not exit_confirmed:
-        output["note"] = "Exit orders were submitted but were not all confirmed fully traded; re-entry was skipped."
-        print(json.dumps(output, indent=2, default=str))
-        log_event("EXIT_REENTRY_SKIPPED", **output)
-        return 1
+        log_event("EXIT_ORDER_STATUS_INCONCLUSIVE", order_statuses=order_statuses)
 
     flat, remaining_positions = wait_for_strategy_flat(dhan)
     if not flat:
         output["remaining_positions"] = remaining_positions
-        output["note"] = "Exit orders were filled, but active F&O positions remain; re-entry was skipped."
+        output["note"] = "Exit could not be confirmed flat after order-status and position polling; re-entry was skipped."
         print(json.dumps(output, indent=2, default=str))
         log_event("EXIT_REENTRY_SKIPPED", **output)
         return 1
 
-    output["note"] = "Exit orders were confirmed fully traded; starting immediate re-entry."
+    if exit_confirmed:
+        output["note"] = "Exit orders filled and positions confirmed flat twice; starting immediate re-entry."
+    else:
+        output["note"] = "Order-status responses remained inconclusive, but positions were confirmed flat twice; starting immediate re-entry safely."
     print(json.dumps(output, indent=2, default=str))
-    log_event("EXIT_CONFIRMED_REENTRY_STARTED", **output)
+    log_event("EXIT_CONFIRMED_REENTRY_STARTED", confirmation_source="orders_and_positions" if exit_confirmed else "positions_fallback", **output)
     return entry_check(config, dhan, analysis=analysis, reentry=True)
 
 
