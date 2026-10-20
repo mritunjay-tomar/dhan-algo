@@ -45,7 +45,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run unit tests
-        run: python -m pytest tests/unit --cov=dhan_algo --cov=main --cov-report=term-missing
+        run: python -m pytest tests/unit --cov=strategy --cov-report=term-missing
 
   dhan-integration:
     name: Dhan API tests (dry run)

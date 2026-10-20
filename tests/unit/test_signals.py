@@ -2,9 +2,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
-from dhan_algo.market import cross_signal, current_direction
-from dhan_algo.options import next_expiry, option_legs, spread_payoff
-from dhan_algo.positions import (spread_profit_target_reached, opposite_supertrend_cross,
+from strategy import (cross_signal, current_direction, next_expiry, option_legs, spread_payoff,
+    spread_profit_target_reached, opposite_supertrend_cross,
     bought_option_expiring_within_two_days, dhan_positions, active_strategy_position)
 
 

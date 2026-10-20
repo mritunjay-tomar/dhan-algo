@@ -1,15 +1,6 @@
-from dataclasses import replace
 from unittest.mock import Mock
 import pytest
-from dhan_algo import execution
-from dhan_algo.broker import DhanBroker
-
-
-@pytest.mark.parametrize("dry,enabled", [(True,False),(True,True),(False,False)])
-def test_broker_never_submits_read_only(config,client,dry,enabled):
-    with pytest.raises(RuntimeError):
-        DhanBroker(client,replace(config,dry_run=dry,live_trading_enabled=enabled)).place_order(security_id="101")
-    client.place_order.assert_not_called()
+import strategy as execution
 
 
 def test_entry_buys_protection_before_short(client):

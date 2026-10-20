@@ -13,10 +13,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import strategy as cloud
-from dhan_algo import http, market
-from dhan_algo import positions as position_rules
-from dhan_algo.broker import DhanBroker
-from dhan_algo.strategies import credit_spread
+
+http = market = position_rules = cloud
 
 NOW = datetime(2026, 10, 12, 16, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
 REASONS = (
@@ -130,21 +128,16 @@ class MockDhanAPI:
         return result
 
     def run(self):
-        broker = (
-            DhanBroker(self.sdk, self.config)
-            if self.module is credit_spread
-            else self.sdk
-        )
-        return self.module.run_strategy(self.config, broker)
+        return self.module.run_strategy(self.config, self.sdk)
 
     def assert_read_only(self):
         self.sdk.place_order.assert_not_called()
         self.sdk.get_order_by_id.assert_not_called()
 
 
-@pytest.fixture(params=[credit_spread, cloud], ids=["runner", "cloud"])
-def implementation(request):
-    return request.param
+@pytest.fixture
+def implementation():
+    return cloud
 
 
 def events(caplog, name):
@@ -484,8 +477,6 @@ def test_api_empty_account_proposes_entry_in_dry_run(
     assert not events(caplog, "EXIT_CONDITIONS_EVALUATED")
     api.sdk.ticker_data.assert_not_called()
     api.assert_read_only()
-
-
 def test_api_price_wrappers_and_quantity_alias(
     implementation, config, positions, chain, monkeypatch, caplog
 ):
@@ -516,24 +507,4 @@ def test_api_closed_position_records_are_treated_as_flat(
     assert len(events(caplog, "DRY_RUN_ENTRY_SIGNAL")) == 1
     assert not events(caplog, "EXIT_CONDITIONS_EVALUATED")
     api.sdk.ticker_data.assert_not_called()
-    api.assert_read_only()
-
-
-@pytest.mark.parametrize("scoped", [True, False])
-def test_api_manual_position_respects_the_configured_scope(
-    config, positions, chain, monkeypatch, caplog, scoped
-):
-    caplog.set_level("INFO")
-    spread = spread_positions(positions)
-    spread.append({**spread[1], "securityId": "999"})
-    cfg = replace(config, security_ids=frozenset({"101", "102"}) if scoped else None)
-    api = MockDhanAPI(credit_spread, monkeypatch, cfg, spread, chain, short_ltp=76)
-    assert api.run() == 0
-    assert len(events(caplog, "DRY_RUN_REENTRY_SIGNAL")) == int(scoped)
-    if scoped:
-        assert len(events(caplog, "DRY_RUN_EXIT_SIGNAL")[0]["current_positions"]) == 2
-    else:
-        assert not events(caplog, "EXIT_CONDITIONS_EVALUATED")[0]["profit_check"][
-            "calculable"
-        ]
     api.assert_read_only()

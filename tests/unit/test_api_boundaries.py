@@ -2,7 +2,9 @@ import json
 from unittest.mock import Mock, MagicMock
 from urllib.error import HTTPError, URLError
 import pytest
-from dhan_algo import auth, http, market
+import strategy as auth
+import strategy as http
+import strategy as market
 
 
 def response(payload):

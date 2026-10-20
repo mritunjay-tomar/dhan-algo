@@ -43,7 +43,7 @@ jobs:
         run: |
           token="$("$PYTHON_BIN" - <<'PY'
           import os
-          from dhan_algo.auth import generate_access_token
+          from strategy import generate_access_token
 
           print(generate_access_token(
               os.environ["CLIENT_ID"],

@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run main.py
+      - name: Run strategy.py
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
@@ -56,8 +56,8 @@ jobs:
           SUPERTREND_MULTIPLIER: ${{ vars.SUPERTREND_MULTIPLIER || '4' }}
           SUPERTREND_LOOKBACK_DAYS: ${{ vars.SUPERTREND_LOOKBACK_DAYS || '60' }}
           DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
-          # Required repository variables. main.py rejects missing or empty values.
+          # Required repository variables. strategy.py rejects missing or empty values.
           # Live orders require DRY_RUN=false and LIVE_TRADING_ENABLED=true.
           DRY_RUN: ${{ vars.DRY_RUN }}
           LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED }}
-        run: '"$PYTHON_BIN" main.py'
+        run: '"$PYTHON_BIN" strategy.py'

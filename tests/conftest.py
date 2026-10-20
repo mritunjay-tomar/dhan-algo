@@ -4,8 +4,7 @@ from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 import socket
 import pytest
-from dhan_algo.config import StrategyConfig
-from dhan_algo.market import MarketAnalysis
+from strategy import MarketAnalysis, StrategyConfig
 
 
 def pytest_addoption(parser):

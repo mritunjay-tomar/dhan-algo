@@ -7,8 +7,10 @@ or a new entry. Defaults remain read-only/dry-run.
 
 import json
 import logging
+import math
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -24,15 +26,18 @@ def log_event(event: str, **details: Any) -> None:
 import ssl
 from datetime import date
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import certifi
 import pandas as pd
 import pandas_ta as ta
+import pyotp
 
 
 API_BASE_URL = "https://api.dhan.co/v2"
+TOKEN_URL = "https://auth.dhan.co/app/generateAccessToken"
 EXIT_ORDER_POLL_INTERVAL_SECONDS = 1.0
 EXIT_ORDER_POLL_ATTEMPTS = 5
 EXIT_ORDER_POLL_TIMEOUT_SECONDS = 30.0
@@ -41,15 +46,10 @@ EXIT_FLAT_CONFIRMATIONS_REQUIRED = 2
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """All runtime inputs needed for one strategy cycle.
-
-    main.py generates access_token from explicit Dhan Cloud template arguments
-    and passes it here. The strategy deliberately does not read or mutate the
-    process environment.
-    """
+    """All runtime inputs needed for one strategy cycle."""
 
     client_id: str
-    access_token: str
+    access_token: str = field(repr=False)
     nifty_security_id: int
     nifty_exchange_segment: str
     nifty_instrument: str
@@ -62,7 +62,6 @@ class StrategyConfig:
     request_timeout_seconds: float = 15.0
     dry_run: bool = True
     live_trading_enabled: bool = False
-    active_spread: dict[str, Any] | None = None
 
     def validate(self) -> None:
         required_values = (
@@ -72,18 +71,101 @@ class StrategyConfig:
             ("nifty_instrument", self.nifty_instrument),
         )
         for name, value in required_values:
-            if not value.strip():
+            if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} is required.")
-        if self.supertrend_atr_period < 1 or self.supertrend_lookback_days < 1:
-            raise ValueError("Supertrend period and lookback days must be positive.")
+        for name in ("supertrend_atr_period", "supertrend_lookback_days", "nifty_security_id", "nifty_option_underlying_security_id"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer.")
+        if type(self.dry_run) is not bool or type(self.live_trading_enabled) is not bool:
+            raise ValueError("Trading flags must be booleans.")
+        if not math.isfinite(self.supertrend_multiplier) or self.supertrend_multiplier <= 0:
+            raise ValueError("Supertrend multiplier must be positive and finite.")
         if (
             type(self.nifty_quantity) is not int
             or self.nifty_quantity < 1
             or type(self.nifty_lot_size) is not int
             or self.nifty_lot_size < 1
+            or not math.isfinite(self.request_timeout_seconds)
             or self.request_timeout_seconds <= 0
         ):
             raise ValueError("Lot count and lot size must be positive integers and request timeout must be positive.")
+
+
+def env_value(name: str, default: str | None = None) -> str:
+    value = os.environ.get(name, default)
+    if value is None or not value.strip():
+        raise ValueError(f"{name} is required; configure it in the environment.")
+    value = value.strip()
+    if "{{" in value or "}}" in value:
+        raise ValueError(f"{name} must contain a value, not a template placeholder.")
+    return value
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = env_value(name, str(default)).lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true or false.")
+    return value == "true"
+
+
+def generate_access_token(client_id: str, pin: str, totp_secret: str, timeout_seconds: float) -> str:
+    """Generate a fresh 24-hour Dhan token using the account's TOTP setup."""
+    if len(pin) != 6 or not pin.isdigit():
+        raise ValueError("DHAN_PIN must be the 6-digit numeric Dhan PIN.")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("DHAN_REQUEST_TIMEOUT_SECONDS must be positive and finite.")
+
+    try:
+        totp = pyotp.TOTP(totp_secret.replace(" ", "")).now()
+    except Exception as error:
+        raise ValueError("DHAN_TOTP_SECRET is not a valid TOTP secret.") from error
+
+    query = urlencode({"dhanClientId": client_id, "pin": pin, "totp": totp})
+    request = Request(f"{TOKEN_URL}?{query}", method="POST")
+    context = ssl.create_default_context(cafile=certifi.where())
+    try:
+        with urlopen(request, timeout=timeout_seconds, context=context) as response:
+            payload: Any = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        # Do not include error.url because it contains the PIN and one-time password.
+        raise RuntimeError(f"Dhan token generation failed with HTTP {error.code}.") from None
+    except URLError as error:
+        raise RuntimeError(f"Could not reach Dhan authentication service: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Dhan authentication returned an invalid JSON response.") from error
+
+    token = payload.get("accessToken") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        message = payload.get("message") if isinstance(payload, dict) else None
+        suffix = f": {message}" if isinstance(message, str) else ""
+        raise RuntimeError(f"Dhan authentication response did not contain an access token{suffix}.")
+
+    LOGGER.info("Generated a fresh Dhan access token; expiry: %s", payload.get("expiryTime", "not supplied"))
+    return token.strip()
+
+
+def load_config() -> StrategyConfig:
+    """Build strategy settings from the process environment."""
+    timeout_seconds = float(env_value("DHAN_REQUEST_TIMEOUT_SECONDS", "15"))
+    config = StrategyConfig(
+        client_id=env_value("CLIENT_ID"),
+        access_token=env_value("DHAN_ACCESS_TOKEN"),
+        nifty_security_id=int(env_value("NIFTY_SECURITY_ID", "15")),
+        nifty_exchange_segment=env_value("NIFTY_EXCHANGE_SEGMENT", "IDX_I"),
+        nifty_instrument=env_value("NIFTY_INSTRUMENT", "INDEX"),
+        nifty_option_underlying_security_id=int(env_value("NIFTY_OPTION_UNDERLYING_SECURITY_ID", "13")),
+        nifty_quantity=int(env_value("NIFTY_QUANTITY", "1")),
+        nifty_lot_size=int(env_value("NIFTY_LOT_SIZE")),
+        supertrend_atr_period=int(env_value("SUPERTREND_ATR_PERIOD", "22")),
+        supertrend_multiplier=float(env_value("SUPERTREND_MULTIPLIER", "4")),
+        supertrend_lookback_days=int(env_value("SUPERTREND_LOOKBACK_DAYS", "60")),
+        request_timeout_seconds=timeout_seconds,
+        dry_run=env_bool("DRY_RUN", True),
+        live_trading_enabled=env_bool("LIVE_TRADING_ENABLED", False),
+    )
+    config.validate()
+    return config
 
 
 @dataclass(frozen=True)
@@ -123,6 +205,9 @@ def candle_rows(response: dict[str, Any]) -> list[dict[str, float]]:
     required = ("open", "high", "low", "close")
     if not isinstance(data, dict) or any(not isinstance(data.get(k), list) for k in required):
         raise ValueError(f"Unexpected historical-data response: {json.dumps(response)[:500]}")
+    count = len(data["close"])
+    if "timestamp" not in data or any(len(data[key]) != count for key in (*required, "timestamp")):
+        raise ValueError("Historical candle columns must have matching lengths and timestamps.")
     return [{**{key: float(data[key][i]) for key in required}, "timestamp": float(data.get("timestamp", [0] * len(data["close"]))[i])} for i in range(len(data["close"]))]
 
 
@@ -152,7 +237,7 @@ def resample_15m_to_30m(candles: list[dict[str, float]]) -> list[dict[str, float
             continue
         first, second = group
         close_time = datetime.fromtimestamp(second["timestamp"], tz=ist) + timedelta(minutes=15)
-        if close_time <= now:
+        if second["timestamp"] - first["timestamp"] == 15 * 60 and close_time <= now:
             result.append({"open": first["open"], "high": max(first["high"], second["high"]), "low": min(first["low"], second["low"]), "close": second["close"], "timestamp": first["timestamp"]})
     return sorted(result, key=lambda candle: candle["timestamp"])
 
@@ -359,7 +444,11 @@ def spread_payoff(sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> d
 
 
 def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> list[dict[str, Any]]:
-    """Enter a credit spread with market orders: buy protection, then sell risk."""
+    """Submit the protective buy, then immediately submit the short sell.
+
+    Dhan can acknowledge an order before its status endpoint reports a fill, so
+    entry checks submission success without waiting on the status endpoint.
+    """
     orders: list[dict[str, Any]] = []
     for leg_name, leg, transaction_type in (
         ("BUY_PROTECTION", buy, "BUY"),
@@ -377,12 +466,6 @@ def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, An
         orders.append(order)
         if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
             raise ValueError(f"{leg_name} order submission failed: {response}")
-        confirmed, statuses = wait_for_orders_traded(dhan, [order], phase="ENTRY")
-        if not confirmed:
-            raise ValueError(
-                f"{leg_name} was not confirmed fully filled; entry stopped. "
-                f"Check Dhan orders/positions before retrying; submitted orders may still be active. Details: {statuses}"
-            )
     return orders
 
 
@@ -433,7 +516,12 @@ def entry_check(
             log_event("ENTRY_ORDER_FAILURE", signal=signal, expiry=expiry, **output)
             return 1
         print(json.dumps(output, indent=2, default=str))
-        log_event("ENTRY_ORDERS_SUBMITTED", signal=signal, expiry=expiry, **output)
+        log_event(
+            "REENTRY_ORDERS_SUBMITTED" if reentry else "ENTRY_ORDERS_SUBMITTED",
+            signal=signal,
+            expiry=expiry,
+            **output,
+        )
         return 0
     except HTTPError as error:
         LOGGER.error("DhanHQ HTTP %s: %s", error.code, error.read().decode("utf-8", errors="replace"))
@@ -583,36 +671,6 @@ def spread_profit_target_reached(
     })
     return bool(check["target_reached"]), check
 
-
-
-def short_legs_at_half_price(dhan: Any, positions: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
-    """Check whether every short is within 5% above its half-price target or lower."""
-    short_legs = short_option_positions(positions)
-    if not short_legs:
-        return False, []
-    prices = ltp_by_security_id(dhan, short_legs)
-    checks: list[dict[str, Any]] = []
-    for position in short_legs:
-        security_id = str(position["securityId"])
-        original_sell_price = float(position["sellAvg"])
-        current_ltp = prices.get(security_id)
-        half_price_target = original_sell_price / 2
-        tolerance = half_price_target * 0.05
-        # A lower LTP has exceeded the profit target, so it remains an exit
-        # signal. The 5% tolerance permits an exit slightly before half price.
-        exit_trigger_price = half_price_target + tolerance
-        checks.append({
-            "security_id": security_id,
-            "original_sell_average": original_sell_price,
-            "current_ltp": current_ltp,
-            "half_original_sell_average": half_price_target,
-            "tolerance_amount": tolerance,
-            "exit_trigger_price": exit_trigger_price,
-            "target_reached": current_ltp is not None and current_ltp <= exit_trigger_price,
-        })
-    return all(check["target_reached"] for check in checks), checks
-
-
 def opposite_supertrend_cross(analysis: MarketAnalysis, positions: list[dict[str, Any]]) -> bool:
     """Exit when the latest completed NIFTY candle is against the supertrend signal."""
     short_legs = short_option_positions(positions)
@@ -678,6 +736,7 @@ def close_open_fno_positions(dhan: Any, positions: list[dict[str, Any]]) -> list
             quantity=quantity,
             order_type="MARKET",
             product_type=str(position.get("productType") or "MARGIN"),
+            price=0,
         )
         log_event("EXIT_ORDER_RESPONSE", security_id=str(position["securityId"]), response=response)
         responses.append({
@@ -685,6 +744,8 @@ def close_open_fno_positions(dhan: Any, positions: list[dict[str, Any]]) -> list
             "quantity": quantity,
             "response": response,
         })
+        if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
+            raise ValueError(f"Exit order submission failed for {position['securityId']}: {response}")
     return responses
 
 
@@ -715,6 +776,8 @@ def order_details(response: dict[str, Any], order_id: str | None = None) -> dict
 
 def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: str) -> tuple[bool, list[dict[str, Any]]]:
     """Confirm submitted orders are fully filled before the next trading step."""
+    if not orders:
+        return False, []
     tracked: list[dict[str, Any]] = []
     for order in orders:
         response = order.get("response")
@@ -798,20 +861,22 @@ def wait_for_strategy_flat(dhan: Any) -> tuple[bool, list[dict[str, Any]]]:
         time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
 
 
-def close_debit(chain: dict[str, Any], state: dict[str, Any]) -> float:
-    """Cost to close: buy short at ask, sell long at bid."""
-    side = "pe" if state["signal"] == "BULLISH" else "ce"
-    options = chain.get("data", {}).get("oc", {})
-    def at_strike(strike: float) -> dict[str, Any]:
-        for key, value in options.items():
-            if abs(float(key) - strike) < 0.001 and isinstance(value, dict):
-                return value
-        raise ValueError(f"Saved spread strike {strike} is absent from the current option chain.")
-    short_leg, long_leg = at_strike(float(state["sell_strike"]))[side], at_strike(float(state["buy_strike"]))[side]
-    short_ask, long_bid = short_leg.get("top_ask_price"), long_leg.get("top_bid_price")
-    if not isinstance(short_ask, (int, float)) or not isinstance(long_bid, (int, float)):
-        raise ValueError("Option chain lacks executable bid/ask prices for the active spread.")
-    return float(short_ask) - float(long_bid)
+def reenter_after_exit(
+    config: StrategyConfig,
+    dhan: Any,
+    analysis: MarketAnalysis,
+    *,
+    simulated_exit: bool = False,
+) -> int:
+    """Immediately open a fresh spread in the current Supertrend direction."""
+    log_event(
+        "REENTRY_STARTED",
+        simulated_exit=simulated_exit,
+        direction=analysis.current_direction,
+    )
+    if simulated_exit:
+        log_event("DRY_RUN_REENTRY_STARTED", simulated_exit=True)
+    return entry_check(config, dhan, analysis=analysis, reentry=True)
 
 
 def exit_check(
@@ -823,6 +888,12 @@ def exit_check(
 ) -> int:
     config.validate()
     analysis = analysis or analyse_market(config)
+    log_event(
+        "EXIT_CHECK_STARTED",
+        position_count=len(positions),
+        dry_run=config.dry_run,
+        live_trading_enabled=config.live_trading_enabled,
+    )
     target_reached, profit_check = spread_profit_target_reached(
         dhan, positions, config.nifty_quantity, config.nifty_lot_size
     )
@@ -851,21 +922,19 @@ def exit_check(
         output["note"] = "Dry-run exit proposed; evaluating a hypothetical re-entry without changing broker positions."
         print(json.dumps(output, indent=2))
         log_event("DRY_RUN_EXIT_SIGNAL", **output)
-        log_event("DRY_RUN_REENTRY_STARTED", simulated_exit=True, position_count=len(positions))
-        return entry_check(config, dhan, analysis=analysis, reentry=True)
+        return reenter_after_exit(config, dhan, analysis, simulated_exit=True)
     try:
         output["orders"] = close_open_fno_positions(dhan, positions)
+        exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
+        output["exit_order_statuses"] = order_statuses
+        if not exit_confirmed:
+            log_event("EXIT_ORDER_STATUS_INCONCLUSIVE", order_statuses=order_statuses)
+        flat, remaining_positions = wait_for_strategy_flat(dhan)
     except Exception as error:
         output["order_error"] = str(error)
         print(json.dumps(output, indent=2, default=str))
         log_event("EXIT_ORDER_FAILURE", **output)
         return 1
-    exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
-    output["exit_order_statuses"] = order_statuses
-    if not exit_confirmed:
-        log_event("EXIT_ORDER_STATUS_INCONCLUSIVE", order_statuses=order_statuses)
-
-    flat, remaining_positions = wait_for_strategy_flat(dhan)
     if not flat:
         output["remaining_positions"] = remaining_positions
         output["note"] = "Exit could not be confirmed flat after order-status and position polling; re-entry was skipped."
@@ -879,7 +948,7 @@ def exit_check(
         output["note"] = "Order-status responses remained inconclusive, but positions were confirmed flat twice; starting immediate re-entry safely."
     print(json.dumps(output, indent=2, default=str))
     log_event("EXIT_CONFIRMED_REENTRY_STARTED", confirmation_source="orders_and_positions" if exit_confirmed else "positions_fallback", **output)
-    return entry_check(config, dhan, analysis=analysis, reentry=True)
+    return reenter_after_exit(config, dhan, analysis)
 
 
 
@@ -894,3 +963,31 @@ def run_strategy(config: StrategyConfig, dhan: Any, *, positions: list[dict[str,
         return exit_check(config, dhan, positions, analysis=analysis)
     log_event("STRATEGY_CYCLE", action="CHECK_NEW_ENTRY", active_position_count=0)
     return entry_check(config, dhan, analysis=analysis)
+
+
+def main() -> int:
+    """Run one scheduled strategy cycle and return a process exit status."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        from dhanhq import DhanContext, dhanhq
+
+        config = load_config()
+        dhan = dhanhq(DhanContext(config.client_id, config.access_token))
+        LOGGER.info(
+            "Scheduled strategy run started: dry_run=%s live_trading_enabled=%s lots=%s",
+            config.dry_run,
+            config.live_trading_enabled,
+            config.nifty_quantity,
+        )
+        positions = dhan_positions(dhan)
+        LOGGER.info("Dhan positions returned: %s", len(positions))
+        result = run_strategy(config, dhan, positions=positions)
+        LOGGER.info("Strategy cycle completed with status: %s", result)
+        return result
+    except Exception:
+        LOGGER.exception("Scheduled strategy run failed.")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
