@@ -3,8 +3,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
 from strategy import (cross_signal, current_direction, next_expiry, option_legs, spread_payoff,
-    spread_profit_target_reached, opposite_supertrend_cross,
-    bought_option_expiring_within_two_days, dhan_positions, active_strategy_position)
+    opposite_supertrend_cross,
+    bought_option_expiring_within_two_days)
+from utils import spread_profit_target_reached, dhan_positions, active_strategy_position
 
 
 @pytest.mark.parametrize("prior,latest,expected", [(99,101,"BULLISH"),(100,101,"BULLISH"),

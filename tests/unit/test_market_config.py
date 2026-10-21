@@ -3,7 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from unittest.mock import Mock
 import pytest
-import strategy as settings
+import utils as settings
 import strategy as market
 
 

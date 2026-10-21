@@ -1,0 +1,61 @@
+name: Dhan profit booking
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC: 09:15 through 15:30 IST, every five minutes on weekdays.
+    - cron: '45,50,55 3 * * 1-5'
+    - cron: '*/5 4-9 * * 1-5'
+    - cron: '0 10 * * 1-5'
+
+permissions:
+  contents: read
+
+# Scheduled and manual cycles must not run concurrently in this repository.
+concurrency:
+  group: dhan-strategy
+  cancel-in-progress: false
+
+jobs:
+  book-profit:
+    runs-on: self-hosted
+    environment: main
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: '1'
+      PYTHON_BIN: /home/github/venvs/dhan-algo/bin/python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify managed Python environment
+        run: |
+          test -x "$PYTHON_BIN"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -c "import dhanhq"
+
+      - name: Verify Dhan access token secret
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$DHAN_ACCESS_TOKEN" ]; then
+            echo "DHAN_ACCESS_TOKEN is missing from the main environment." >&2
+            exit 1
+          fi
+
+      - name: Run profit_booking.py
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+          # Required positive integer inputs. The runner sends lots × lot_size units to Dhan.
+          NIFTY_QUANTITY: ${{ vars.NIFTY_QUANTITY }}
+          NIFTY_LOT_SIZE: ${{ vars.NIFTY_LOT_SIZE }}
+          DHAN_REQUEST_TIMEOUT_SECONDS: ${{ vars.DHAN_REQUEST_TIMEOUT_SECONDS || '15' }}
+          # Required repository variables. utils.py rejects missing or empty values.
+          # Live orders require DRY_RUN=false and LIVE_TRADING_ENABLED=true.
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED }}
+        run: '"$PYTHON_BIN" profit_booking.py'

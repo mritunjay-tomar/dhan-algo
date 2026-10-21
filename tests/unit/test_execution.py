@@ -1,34 +1,40 @@
 from unittest.mock import Mock
 import pytest
-import strategy as execution
+import utils as execution
+import strategy
 
 
 def test_entry_buys_protection_before_short(client):
-    execution.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
+    strategy.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
     assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list]==["BUY","SELL"]
-    client.get_order_by_id.assert_not_called()
+    assert client.get_order_by_id.call_count == 2
 
 
 def test_failed_buy_submission_blocks_short(client):
     client.place_order.return_value={"status":"failure"}
     with pytest.raises(ValueError):
-        execution.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
+        strategy.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
     assert client.place_order.call_count==1
 
 
-def test_entry_submits_short_when_buy_fill_status_is_unavailable(client):
-    client.get_order_by_id.side_effect=AssertionError("Entry must not poll for a fill")
-    execution.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
-    assert [call.kwargs["transaction_type"] for call in client.place_order.call_args_list] == ["BUY", "SELL"]
-    client.get_order_by_id.assert_not_called()
+def test_entry_waits_for_hedge_fill_and_blocks_short_when_unknown(client, monkeypatch):
+    monkeypatch.setattr(execution, "EXIT_ORDER_POLL_ATTEMPTS", 1)
+    client.get_order_by_id.return_value = {"data": {"orderStatus": "PENDING", "filledQty": 0}}
+    with pytest.raises(ValueError, match="BUY_PROTECTION was not fully traded"):
+        strategy.place_credit_spread_entry(client, {"security_id": "101"}, {"security_id": "102"}, 25)
+    assert client.place_order.call_count == 1
+    assert client.place_order.call_args.kwargs["transaction_type"] == "BUY"
 
 
-def test_exit_closes_short_before_hedge_without_waiting(client,positions):
-    execution.close_open_fno_positions(client,list(reversed(positions)))
-    assert [c.kwargs["security_id"] for c in client.place_order.call_args_list]==["101","102"]
-    assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list]==["BUY","SELL"]
-    assert all(c.kwargs["order_type"]=="MARKET" and c.kwargs["price"]==0 for c in client.place_order.call_args_list)
-    client.get_order_by_id.assert_not_called()
+def test_exit_confirms_short_fill_and_position_before_selling_hedge(client, positions):
+    client.get_positions.side_effect = [{"data": [positions[1]]}, {"data": [positions[1]]}, {"data": []}]
+    execution.close_open_fno_positions(client, list(reversed(positions)))
+    assert [c.kwargs["security_id"] for c in client.place_order.call_args_list] == ["101", "102"]
+    calls = client.mock_calls
+    first_place = next(i for i, c in enumerate(calls) if c[0] == "place_order")
+    second_place = next(i for i, c in enumerate(calls) if c[0] == "place_order" and i > first_place)
+    assert any(c[0] == "get_order_by_id" for c in calls[first_place + 1:second_place])
+    assert any(c[0] == "get_positions" for c in calls[first_place + 1:second_place])
 
 
 def test_rejected_short_exit_submission_keeps_hedge(client,positions):
@@ -111,3 +117,18 @@ def test_order_details_accepts_direct_wrapped_and_list_shapes():
     assert execution.order_details(expected,"1") == expected
     assert execution.order_details({"status":"success","data":expected},"1") == expected
     assert execution.order_details({"data":{"data":[expected]}},"1") == expected
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_another_orders_fill_cannot_confirm_this_order(wrapped):
+    payload = {"orderId": "another-order", "orderStatus": "TRADED", "filledQty": 25}
+    response = {"data": [payload]} if wrapped else payload
+    assert execution.order_details(response, "expected-order") == {}
+
+
+@pytest.mark.parametrize("filled", [float("inf"), float("nan"), 26])
+def test_invalid_or_excess_fill_cannot_confirm_order(client, monkeypatch, filled):
+    monkeypatch.setattr(execution, "EXIT_ORDER_POLL_ATTEMPTS", 1)
+    client.get_order_by_id.return_value = {"data": {"orderStatus": "TRADED", "filledQty": filled}}
+    order = {"security_id": "101", "quantity": 25, "response": {"data": {"orderId": "1"}}}
+    assert not execution.wait_for_orders_traded(client, [order], phase="TEST")[0]

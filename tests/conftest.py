@@ -47,7 +47,8 @@ def positions():
 
 @pytest.fixture
 def client():
-    client = Mock(spec=["get_positions", "ticker_data", "place_order", "get_order_by_id"])
+    client = Mock(spec=["get_positions", "ticker_data", "place_order", "get_order_by_id", "get_order_list"])
+    client.get_order_list.return_value = {"status": "success", "data": []}
     client.get_positions.return_value = {"status": "success", "data": []}
     client.ticker_data.return_value = {"status": "success", "data": {"data": {"NSE_FNO": {
         "101": {"last_price": 80}, "102": {"last_price": 52}

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import strategy as cloud
+import profit_booking
 
 http = market = position_rules = cloud
 
@@ -130,6 +131,9 @@ class MockDhanAPI:
     def run(self):
         return self.module.run_strategy(self.config, self.sdk)
 
+    def run_profit(self):
+        return profit_booking.run_profit_booking(self.config, self.sdk)
+
     def assert_read_only(self):
         self.sdk.place_order.assert_not_called()
         self.sdk.get_order_by_id.assert_not_called()
@@ -204,17 +208,14 @@ def test_api_dry_run_exit_and_reentry_matrix(
     )
     assert api.run() == 0
     api.sdk.get_positions.assert_called_once_with()
-    api.sdk.ticker_data.assert_called_once_with({"NSE_FNO": [101, 102]})
+    api.sdk.ticker_data.assert_not_called()
     checks = events(caplog, "EXIT_CONDITIONS_EVALUATED")
     assert len(checks) == 1
     check = checks[0]
     expected = [
-        reason for flag, reason in zip((target, cross, expiry), REASONS) if flag
+        reason for flag, reason in zip((False, cross, expiry), REASONS) if flag
     ]
     assert check["reasons"] == expected
-    assert check["profit_check"]["maximum_profit"] == 1200
-    assert check["profit_check"]["profit_booking_amount"] == 600
-    assert check["profit_check"]["running_profit"] == (600 if target else 500)
     evaluation = events(caplog, "SUPERTREND_EVALUATED")[0]
     if cross:
         assert evaluation["crossover_signal"] == (
@@ -279,9 +280,9 @@ def test_api_profit_target_boundaries_include_both_legs(
         short_ltp=short_ltp,
         long_ltp=long_ltp,
     )
-    assert api.run() == 0
-    assert bool(events(caplog, "DRY_RUN_EXIT_SIGNAL")) == exit_required
-    assert bool(events(caplog, "DRY_RUN_REENTRY_SIGNAL")) == exit_required
+    assert api.run_profit() == 0
+    assert bool(events(caplog, "DRY_RUN_PROFIT_EXIT")) == exit_required
+    assert not events(caplog, "DRY_RUN_REENTRY_SIGNAL")
     api.assert_read_only()
 
 
@@ -333,8 +334,8 @@ def test_api_bad_quote_response_fails_without_reentry(
     )
     api.sdk.ticker_data.return_value = payload
     with pytest.raises(ValueError):
-        api.run()
-    assert [call["path"] for call in api.calls] == ["/charts/intraday"]
+        api.run_profit()
+    assert api.calls == []
     api.assert_read_only()
 
 
@@ -357,8 +358,8 @@ def test_api_unavailable_quote_does_not_fabricate_profit_exit(
         implementation, monkeypatch, config, spread_positions(positions), chain
     )
     api.sdk.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"] = quote
-    assert api.run() == 0
-    check = events(caplog, "EXIT_CONDITIONS_EVALUATED")[0]["profit_check"]
+    assert api.run_profit() == 1
+    check = events(caplog, "PROFIT_TARGET_CHECKED")[0]
     assert not check["calculable"] and not check["target_reached"]
     assert not events(caplog, "DRY_RUN_REENTRY_SIGNAL")
     api.assert_read_only()
@@ -397,6 +398,7 @@ def test_api_bad_http_payloads_produce_failure(
         spread_positions(positions),
         chain,
         short_ltp=76,
+        pattern="cross_down",
     )
     api.responses[path] = payload
     if path == "/charts/intraday":
@@ -408,7 +410,7 @@ def test_api_bad_http_payloads_produce_failure(
     api.assert_read_only()
 
 
-@pytest.mark.parametrize("trigger", ["profit", "expiry", "crossover"])
+@pytest.mark.parametrize("trigger", ["expiry", "crossover"])
 def test_api_each_repeated_exit_has_one_reentry(
     implementation, config, positions, chain, monkeypatch, caplog, trigger
 ):
@@ -427,7 +429,8 @@ def test_api_each_repeated_exit_has_one_reentry(
     assert len(events(caplog, "DRY_RUN_EXIT_SIGNAL")) == 3
     assert len(events(caplog, "DRY_RUN_REENTRY_STARTED")) == 3
     assert len(events(caplog, "DRY_RUN_REENTRY_SIGNAL")) == 3
-    assert api.sdk.get_positions.call_count == api.sdk.ticker_data.call_count == 3
+    assert api.sdk.get_positions.call_count == 3
+    api.sdk.ticker_data.assert_not_called()
     api.assert_read_only()
 
 
@@ -447,6 +450,7 @@ def test_api_http_failures_are_not_successful_trade_cycles(
         spread_positions(positions),
         chain,
         short_ltp=76,
+        pattern="cross_down",
     )
     api.responses[path] = (
         URLError("mock network unavailable")
@@ -490,8 +494,8 @@ def test_api_price_wrappers_and_quantity_alias(
         "data": {"NSE_FNO": {"101": 76, "102": 52}},
     }
     api.responses["/charts/intraday"] = {"data": api.responses["/charts/intraday"]}
-    assert api.run() == 0
-    assert len(events(caplog, "DRY_RUN_REENTRY_SIGNAL")) == 1
+    assert api.run_profit() == 0
+    assert len(events(caplog, "DRY_RUN_PROFIT_EXIT")) == 1
     api.assert_read_only()
 
 

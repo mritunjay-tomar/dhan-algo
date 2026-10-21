@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""Self-contained NIFTY credit-spread strategy for Dhan Cloud.
+"""NIFTY entries, Supertrend stop-loss and expiry exits.
 
-One scheduled invocation checks Dhan positions, then evaluates an active spread
-or a new entry. Defaults remain read-only/dry-run.
+Profit targets are monitored separately by profit_booking.py every five minutes.
 """
 
 import json
 import logging
 import math
-import os
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 
+from utils import (
+    StrategyConfig,
+    active_strategy_position,
+    close_open_fno_positions,
+    dhan_positions,
+    load_config,
+    log_event,
+    wait_for_orders_traded,
+    wait_for_strategy_flat
+)
+import utils
+
 LOGGER = logging.getLogger("dhan_strategy")
 
-
-def log_event(event: str, **details: Any) -> None:
-    """Emit one structured, credential-free audit record to Cloud logs."""
-    record = {"timestamp_ist": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(), "event": event, **details}
-    LOGGER.info("%s", json.dumps(record, separators=(",", ":"), default=str))
 
 import ssl
 from datetime import date
@@ -38,75 +42,6 @@ import pyotp
 
 API_BASE_URL = "https://api.dhan.co/v2"
 TOKEN_URL = "https://auth.dhan.co/app/generateAccessToken"
-EXIT_ORDER_POLL_INTERVAL_SECONDS = 1.0
-EXIT_ORDER_POLL_ATTEMPTS = 5
-EXIT_ORDER_POLL_TIMEOUT_SECONDS = 30.0
-EXIT_FLAT_CONFIRMATIONS_REQUIRED = 2
-
-
-@dataclass(frozen=True)
-class StrategyConfig:
-    """All runtime inputs needed for one strategy cycle."""
-
-    client_id: str
-    access_token: str = field(repr=False)
-    nifty_security_id: int
-    nifty_exchange_segment: str
-    nifty_instrument: str
-    nifty_option_underlying_security_id: int = 13
-    supertrend_atr_period: int = 22
-    supertrend_multiplier: float = 4.0
-    supertrend_lookback_days: int = 60
-    nifty_quantity: int = 1  # Number of lots.
-    nifty_lot_size: int = 1  # Units per lot, supplied by the deployment configuration.
-    request_timeout_seconds: float = 15.0
-    dry_run: bool = True
-    live_trading_enabled: bool = False
-
-    def validate(self) -> None:
-        required_values = (
-            ("client_id", self.client_id),
-            ("access_token", self.access_token),
-            ("nifty_exchange_segment", self.nifty_exchange_segment),
-            ("nifty_instrument", self.nifty_instrument),
-        )
-        for name, value in required_values:
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name} is required.")
-        for name in ("supertrend_atr_period", "supertrend_lookback_days", "nifty_security_id", "nifty_option_underlying_security_id"):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{name} must be a positive integer.")
-        if type(self.dry_run) is not bool or type(self.live_trading_enabled) is not bool:
-            raise ValueError("Trading flags must be booleans.")
-        if not math.isfinite(self.supertrend_multiplier) or self.supertrend_multiplier <= 0:
-            raise ValueError("Supertrend multiplier must be positive and finite.")
-        if (
-            type(self.nifty_quantity) is not int
-            or self.nifty_quantity < 1
-            or type(self.nifty_lot_size) is not int
-            or self.nifty_lot_size < 1
-            or not math.isfinite(self.request_timeout_seconds)
-            or self.request_timeout_seconds <= 0
-        ):
-            raise ValueError("Lot count and lot size must be positive integers and request timeout must be positive.")
-
-
-def env_value(name: str, default: str | None = None) -> str:
-    value = os.environ.get(name, default)
-    if value is None or not value.strip():
-        raise ValueError(f"{name} is required; configure it in the environment.")
-    value = value.strip()
-    if "{{" in value or "}}" in value:
-        raise ValueError(f"{name} must contain a value, not a template placeholder.")
-    return value
-
-
-def env_bool(name: str, default: bool) -> bool:
-    value = env_value(name, str(default)).lower()
-    if value not in {"true", "false"}:
-        raise ValueError(f"{name} must be true or false.")
-    return value == "true"
 
 
 def generate_access_token(client_id: str, pin: str, totp_secret: str, timeout_seconds: float) -> str:
@@ -143,29 +78,6 @@ def generate_access_token(client_id: str, pin: str, totp_secret: str, timeout_se
 
     LOGGER.info("Generated a fresh Dhan access token; expiry: %s", payload.get("expiryTime", "not supplied"))
     return token.strip()
-
-
-def load_config() -> StrategyConfig:
-    """Build strategy settings from the process environment."""
-    timeout_seconds = float(env_value("DHAN_REQUEST_TIMEOUT_SECONDS", "15"))
-    config = StrategyConfig(
-        client_id=env_value("CLIENT_ID"),
-        access_token=env_value("DHAN_ACCESS_TOKEN"),
-        nifty_security_id=int(env_value("NIFTY_SECURITY_ID", "15")),
-        nifty_exchange_segment=env_value("NIFTY_EXCHANGE_SEGMENT", "IDX_I"),
-        nifty_instrument=env_value("NIFTY_INSTRUMENT", "INDEX"),
-        nifty_option_underlying_security_id=int(env_value("NIFTY_OPTION_UNDERLYING_SECURITY_ID", "13")),
-        nifty_quantity=int(env_value("NIFTY_QUANTITY", "1")),
-        nifty_lot_size=int(env_value("NIFTY_LOT_SIZE")),
-        supertrend_atr_period=int(env_value("SUPERTREND_ATR_PERIOD", "22")),
-        supertrend_multiplier=float(env_value("SUPERTREND_MULTIPLIER", "4")),
-        supertrend_lookback_days=int(env_value("SUPERTREND_LOOKBACK_DAYS", "60")),
-        request_timeout_seconds=timeout_seconds,
-        dry_run=env_bool("DRY_RUN", True),
-        live_trading_enabled=env_bool("LIVE_TRADING_ENABLED", False),
-    )
-    config.validate()
-    return config
 
 
 @dataclass(frozen=True)
@@ -444,11 +356,12 @@ def spread_payoff(sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> d
 
 
 def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> list[dict[str, Any]]:
-    """Submit the protective buy, then immediately submit the short sell.
+    """Buy and confirm the hedge before submitting the short option.
 
-    Dhan can acknowledge an order before its status endpoint reports a fill, so
-    entry checks submission success without waiting on the status endpoint.
+    An acknowledgement is not a fill: the hedge must actually exist before the
+    short leg is opened so the broker recognises the protected spread.
     """
+    utils.ensure_no_pending_orders(dhan)
     orders: list[dict[str, Any]] = []
     for leg_name, leg, transaction_type in (
         ("BUY_PROTECTION", buy, "BUY"),
@@ -466,8 +379,10 @@ def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, An
         orders.append(order)
         if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
             raise ValueError(f"{leg_name} order submission failed: {response}")
+        confirmed, statuses = wait_for_orders_traded(dhan, [order], phase="ENTRY")
+        if not confirmed:
+            raise ValueError(f"{leg_name} was not fully traded: {statuses}")
     return orders
-
 
 
 def entry_check(
@@ -532,36 +447,6 @@ def entry_check(
     return 1
 
 
-
-
-def dhan_positions(dhan: Any) -> list[dict[str, Any]]:
-    """Fetch the current account positions through the authenticated Dhan SDK."""
-    payload = dhan.get_positions()
-    # Dhan API versions may return either a list directly or wrap it in a data
-    # field. Reject any other response shape instead of iterating dictionary
-    # keys and accidentally treating a malformed response as a position list.
-    if isinstance(payload, dict) and str(payload.get("status", "")).lower() == "failure":
-        raise ValueError("Dhan positions request failed.")
-    positions = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if not isinstance(positions, list):
-        raise ValueError("Unexpected positions response from Dhan.")
-    if any(not isinstance(position, dict) for position in positions):
-        raise ValueError("Malformed position in Dhan response.")
-    result = positions
-    log_event("POSITIONS_FETCHED", total_positions=len(result), active_fno_positions=sum(1 for position in result if str(position.get("exchangeSegment")) == "NSE_FNO" and float(position.get("netQty", position.get("netQuantity", 0)) or 0) != 0))
-    return result
-
-
-def active_strategy_position(positions: list[dict[str, Any]]) -> bool:
-    """Return whether the live Dhan position payload has an active NIFTY F&O leg."""
-    # Account is dedicated to this strategy: any non-zero NIFTY F&O position is active.
-    return any(
-        str(position.get('exchangeSegment')) == 'NSE_FNO'
-        and float(position.get('netQty', position.get('netQuantity', 0)) or 0) != 0
-        for position in positions
-    )
-
-
 def short_option_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Select live Dhan F&O short option legs with their original sell average."""
     short_legs: list[dict[str, Any]] = []
@@ -579,97 +464,6 @@ def short_option_positions(positions: list[dict[str, Any]]) -> list[dict[str, An
             short_legs.append(position)
     return short_legs
 
-
-def ltp_by_security_id(dhan: Any, positions: list[dict[str, Any]]) -> dict[str, float]:
-    """Fetch current LTPs through the Dhan SDK's ticker-data method."""
-    security_ids = [int(position["securityId"]) for position in positions]
-    log_event("LTP_REQUEST", exchange_segment="NSE_FNO", security_ids=security_ids)
-    payload = dhan.ticker_data({"NSE_FNO": security_ids})
-    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() == "failure":
-        raise ValueError("Dhan ticker request failed.")
-    data = payload.get("data", {})
-    data = data.get("data", data) if isinstance(data, dict) else {}
-    segment_data = data.get("NSE_FNO") if isinstance(data, dict) else None
-    if not isinstance(segment_data, dict):
-        raise ValueError("Unexpected Dhan ticker response.")
-    prices: dict[str, float] = {}
-    if isinstance(segment_data, dict):
-        for security_id, quote in segment_data.items():
-            if isinstance(quote, dict):
-                price = quote.get("last_price")
-                if isinstance(price, (int, float)):
-                    prices[str(security_id)] = float(price)
-            elif isinstance(quote, (int, float)):
-                prices[str(security_id)] = float(quote)
-    log_event("LTP_RESPONSE", response_keys=sorted(payload) if isinstance(payload, dict) else [], prices_found=list(prices))
-    return prices
-
-
-def spread_profit_target_reached(
-    dhan: Any,
-    positions: list[dict[str, Any]],
-    lots: int,
-    lot_size: int,
-) -> tuple[bool, dict[str, Any]]:
-    """Return whether running spread profit has reached 50% of maximum credit."""
-    live_options = [
-        position for position in positions
-        if str(position.get("exchangeSegment")) == "NSE_FNO"
-        and str(position.get("drvOptionType", "")).upper() in {"CALL", "PUT"}
-        and float(position.get("netQty", position.get("netQuantity", 0)) or 0) != 0
-    ]
-    short_legs = [position for position in live_options if float(position.get("netQty", position.get("netQuantity", 0)) or 0) < 0]
-    long_legs = [position for position in live_options if float(position.get("netQty", position.get("netQuantity", 0)) or 0) > 0]
-    check: dict[str, Any] = {
-        "lots": lots,
-        "lot_size": lot_size,
-        "quantity": lots * lot_size,
-        "target_fraction": 0.5,
-        "calculable": False,
-        "target_reached": False,
-    }
-    if len(short_legs) != 1 or len(long_legs) != 1:
-        check["reason"] = "Expected exactly one live short option and one live long option."
-        return False, check
-
-    short_leg, long_leg = short_legs[0], long_legs[0]
-    sell_average = short_leg.get("sellAvg")
-    buy_average = long_leg.get("buyAvg")
-    if not isinstance(sell_average, (int, float)) or not isinstance(buy_average, (int, float)):
-        check["reason"] = "Dhan positions are missing the sell or buy entry average."
-        return False, check
-
-    sell_average, buy_average = float(sell_average), float(buy_average)
-    quantity = lots * lot_size
-    maximum_profit = (sell_average - buy_average) * quantity
-    if sell_average <= 0 or buy_average < 0 or maximum_profit <= 0:
-        check["reason"] = "Position averages do not describe a positive-credit spread."
-        return False, check
-
-    prices = ltp_by_security_id(dhan, [short_leg, long_leg])
-    short_ltp = prices.get(str(short_leg["securityId"]))
-    long_ltp = prices.get(str(long_leg["securityId"]))
-    check.update({
-        "short_security_id": str(short_leg["securityId"]),
-        "long_security_id": str(long_leg["securityId"]),
-        "short_sell_average": sell_average,
-        "long_buy_average": buy_average,
-        "short_ltp": short_ltp,
-        "long_ltp": long_ltp,
-        "maximum_profit": maximum_profit,
-        "profit_booking_amount": maximum_profit * 0.5,
-    })
-    if short_ltp is None or long_ltp is None or short_ltp <= 0 or long_ltp <= 0:
-        check["reason"] = "A valid current LTP is unavailable for one or both spread legs."
-        return False, check
-
-    running_profit = ((sell_average - short_ltp) + (long_ltp - buy_average)) * quantity
-    check.update({
-        "running_profit": running_profit,
-        "calculable": True,
-        "target_reached": running_profit >= check["profit_booking_amount"],
-    })
-    return bool(check["target_reached"]), check
 
 def opposite_supertrend_cross(analysis: MarketAnalysis, positions: list[dict[str, Any]]) -> bool:
     """Exit when the latest completed NIFTY candle is against the supertrend signal."""
@@ -714,153 +508,6 @@ def bought_option_expiring_within_two_days(positions: list[dict[str, Any]]) -> b
     return False
 
 
-def close_open_fno_positions(dhan: Any, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Submit market orders: buy to close shorts, then sell to close long hedges."""
-    live_legs = [
-        position for position in positions
-        if str(position.get("exchangeSegment")) == "NSE_FNO"
-        and float(position.get("netQty", position.get("netQuantity", 0)) or 0) != 0
-        and position.get("securityId")
-    ]
-    short_legs = [position for position in live_legs if float(position.get("netQty", position.get("netQuantity", 0)) or 0) < 0]
-    long_legs = [position for position in live_legs if float(position.get("netQty", position.get("netQuantity", 0)) or 0) > 0]
-    responses: list[dict[str, Any]] = []
-    for position in short_legs + long_legs:
-        quantity = abs(int(float(position.get("netQty", position.get("netQuantity", 0)) or 0)))
-        transaction_type = "BUY" if position in short_legs else "SELL"
-        log_event("EXIT_ORDER_INTENT", security_id=str(position["securityId"]), transaction_type=transaction_type, quantity=quantity, order_type="MARKET", product_type=str(position.get("productType") or "MARGIN"))
-        response = dhan.place_order(
-            security_id=str(position["securityId"]),
-            exchange_segment="NSE_FNO",
-            transaction_type=transaction_type,
-            quantity=quantity,
-            order_type="MARKET",
-            product_type=str(position.get("productType") or "MARGIN"),
-            price=0,
-        )
-        log_event("EXIT_ORDER_RESPONSE", security_id=str(position["securityId"]), response=response)
-        responses.append({
-            "security_id": str(position["securityId"]),
-            "quantity": quantity,
-            "response": response,
-        })
-        if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
-            raise ValueError(f"Exit order submission failed for {position['securityId']}: {response}")
-    return responses
-
-
-def order_details(response: dict[str, Any], order_id: str | None = None) -> dict[str, Any]:
-    """Return order details from direct, SDK-wrapped, or single-item list responses."""
-    value: Any = response
-    for _ in range(3):
-        if isinstance(value, dict):
-            if any(key in value for key in ("orderStatus", "order_status", "filledQty", "filled_qty")):
-                return value
-            if "data" not in value:
-                return value
-            value = value["data"]
-            continue
-        if isinstance(value, list):
-            candidates = [item for item in value if isinstance(item, dict)]
-            if order_id is not None:
-                match = next((item for item in candidates if str(item.get("orderId", item.get("order_id", ""))) == order_id), None)
-                if match is not None:
-                    value = match
-                    continue
-            if len(candidates) == 1:
-                value = candidates[0]
-                continue
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def wait_for_orders_traded(dhan: Any, orders: list[dict[str, Any]], *, phase: str) -> tuple[bool, list[dict[str, Any]]]:
-    """Confirm submitted orders are fully filled before the next trading step."""
-    if not orders:
-        return False, []
-    tracked: list[dict[str, Any]] = []
-    for order in orders:
-        response = order.get("response")
-        payload = order_details(response) if isinstance(response, dict) else {}
-        order_id = payload.get("orderId", payload.get("order_id"))
-        if (not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure"
-                or not isinstance(order_id, (str, int)) or not str(order_id)):
-            log_event(f"{phase}_ORDER_CONFIRMATION_UNAVAILABLE", security_id=order.get("security_id"), response=response)
-            return False, tracked
-        tracked.append({**order, "order_id": str(order_id)})
-
-    latest_statuses: list[dict[str, Any]] = []
-    for attempt in range(1, EXIT_ORDER_POLL_ATTEMPTS + 1):
-        latest_statuses = []
-        all_traded = True
-        for order in tracked:
-            try:
-                status_response = dhan.get_order_by_id(order["order_id"])
-            except Exception as error:
-                status_response = {"status": "failure", "remarks": str(error)}
-            payload = order_details(status_response, order["order_id"]) if isinstance(status_response, dict) else {}
-            status = str(payload.get("orderStatus", payload.get("order_status", ""))).upper()
-            filled_quantity = payload.get("filledQty", payload.get("filled_qty"))
-            try:
-                fully_filled = float(filled_quantity) >= float(order["quantity"])
-            except (TypeError, ValueError):
-                fully_filled = False
-            record = {
-                "security_id": order["security_id"],
-                "order_id": order["order_id"],
-                "order_status": status,
-                "filled_quantity": filled_quantity,
-                "expected_quantity": order["quantity"],
-                "fully_filled": fully_filled,
-                "response_status": status_response.get("status") if isinstance(status_response, dict) else None,
-                "response_data_type": type(status_response.get("data")).__name__ if isinstance(status_response, dict) and "data" in status_response else type(status_response).__name__,
-                "response_keys": sorted(str(key) for key in status_response) if isinstance(status_response, dict) else [],
-                "payload_keys": sorted(str(key) for key in payload),
-                "response_remarks": status_response.get("remarks") if isinstance(status_response, dict) else None,
-            }
-            latest_statuses.append(record)
-            if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
-                log_event(f"{phase}_ORDER_NOT_FULLY_TRADED", order_statuses=latest_statuses)
-                return False, latest_statuses
-            if status != "TRADED" or not fully_filled:
-                all_traded = False
-        log_event(f"{phase}_ORDER_POLL_ATTEMPT", attempt=attempt, maximum_attempts=EXIT_ORDER_POLL_ATTEMPTS, order_statuses=latest_statuses)
-        if all_traded:
-            log_event(f"{phase}_ORDERS_CONFIRMED_TRADED", order_statuses=latest_statuses)
-            return True, latest_statuses
-        if attempt < EXIT_ORDER_POLL_ATTEMPTS:
-            time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
-    log_event(f"{phase}_ORDER_CONFIRMATION_EXHAUSTED", attempts=EXIT_ORDER_POLL_ATTEMPTS, order_statuses=latest_statuses)
-    return False, latest_statuses
-
-def wait_for_exit_orders_traded(dhan: Any, orders: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
-    """Confirm all exit orders before re-entry."""
-    return wait_for_orders_traded(dhan, orders, phase="EXIT")
-
-
-def wait_for_strategy_flat(dhan: Any) -> tuple[bool, list[dict[str, Any]]]:
-    """Require consecutive position reads showing the account is flat."""
-    deadline = time.monotonic() + EXIT_ORDER_POLL_TIMEOUT_SECONDS
-    consecutive_flat = 0
-    while True:
-        positions = dhan_positions(dhan)
-        if not active_strategy_position(positions):
-            consecutive_flat += 1
-            log_event("EXIT_FLAT_POSITION_OBSERVED", consecutive_confirmations=consecutive_flat, required_confirmations=EXIT_FLAT_CONFIRMATIONS_REQUIRED)
-            if consecutive_flat >= EXIT_FLAT_CONFIRMATIONS_REQUIRED:
-                log_event("EXIT_POSITIONS_CONFIRMED_FLAT")
-                return True, positions
-        else:
-            consecutive_flat = 0
-        # Once the first flat snapshot arrives, always allow the confirming
-        # read even if it lands on the timeout boundary.
-        if time.monotonic() >= deadline and consecutive_flat == 0:
-            log_event("EXIT_POSITION_CONFIRMATION_TIMED_OUT", remaining_positions=positions)
-            return False, positions
-        log_event("EXIT_WAITING_FOR_POSITION_UPDATE")
-        time.sleep(EXIT_ORDER_POLL_INTERVAL_SECONDS)
-
-
 def reenter_after_exit(
     config: StrategyConfig,
     dhan: Any,
@@ -894,23 +541,17 @@ def exit_check(
         dry_run=config.dry_run,
         live_trading_enabled=config.live_trading_enabled,
     )
-    target_reached, profit_check = spread_profit_target_reached(
-        dhan, positions, config.nifty_quantity, config.nifty_lot_size
-    )
     opposite_cross = opposite_supertrend_cross(analysis, positions)
     expiry_within_two_days = bought_option_expiring_within_two_days(positions)
     reasons: list[str] = []
-    if target_reached:
-        reasons.append("RUNNING_PROFIT_AT_OR_ABOVE_50_PERCENT_OF_MAXIMUM_PROFIT")
     if opposite_cross:
         reasons.append("OPPOSITE_30_MINUTE_SUPERTREND_CROSS")
     if expiry_within_two_days:
         reasons.append("LONG_OPTION_EXPIRY_WITHIN_TWO_DAYS")
-    log_event("EXIT_CONDITIONS_EVALUATED", target_reached=target_reached, opposite_supertrend_cross=opposite_cross, long_option_expiry_within_two_days=expiry_within_two_days, reasons=reasons, profit_check=profit_check)
+    log_event("EXIT_CONDITIONS_EVALUATED", opposite_supertrend_cross=opposite_cross, long_option_expiry_within_two_days=expiry_within_two_days, reasons=reasons)
     output: dict[str, Any] = {
         "exit_required": bool(reasons),
         "reasons": reasons,
-        "profit_check": profit_check,
         "current_positions": positions,
     }
     if not reasons:
@@ -925,10 +566,6 @@ def exit_check(
         return reenter_after_exit(config, dhan, analysis, simulated_exit=True)
     try:
         output["orders"] = close_open_fno_positions(dhan, positions)
-        exit_confirmed, order_statuses = wait_for_exit_orders_traded(dhan, output["orders"])
-        output["exit_order_statuses"] = order_statuses
-        if not exit_confirmed:
-            log_event("EXIT_ORDER_STATUS_INCONCLUSIVE", order_statuses=order_statuses)
         flat, remaining_positions = wait_for_strategy_flat(dhan)
     except Exception as error:
         output["order_error"] = str(error)
@@ -942,15 +579,10 @@ def exit_check(
         log_event("EXIT_REENTRY_SKIPPED", **output)
         return 1
 
-    if exit_confirmed:
-        output["note"] = "Exit orders filled and positions confirmed flat twice; starting immediate re-entry."
-    else:
-        output["note"] = "Order-status responses remained inconclusive, but positions were confirmed flat twice; starting immediate re-entry safely."
+    output["note"] = "Exit orders filled and positions confirmed flat twice; starting immediate re-entry."
     print(json.dumps(output, indent=2, default=str))
-    log_event("EXIT_CONFIRMED_REENTRY_STARTED", confirmation_source="orders_and_positions" if exit_confirmed else "positions_fallback", **output)
+    log_event("EXIT_CONFIRMED_REENTRY_STARTED", confirmation_source="orders_and_positions", **output)
     return reenter_after_exit(config, dhan, analysis)
-
-
 
 
 def run_strategy(config: StrategyConfig, dhan: Any, *, positions: list[dict[str, Any]] | None = None) -> int:
@@ -979,9 +611,10 @@ def main() -> int:
             config.live_trading_enabled,
             config.nifty_quantity,
         )
-        positions = dhan_positions(dhan)
-        LOGGER.info("Dhan positions returned: %s", len(positions))
-        result = run_strategy(config, dhan, positions=positions)
+        with utils.trading_lock(config.client_id):
+            positions = dhan_positions(dhan)
+            LOGGER.info("Dhan positions returned: %s", len(positions))
+            result = run_strategy(config, dhan, positions=positions)
         LOGGER.info("Strategy cycle completed with status: %s", result)
         return result
     except Exception:
