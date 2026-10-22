@@ -4,24 +4,24 @@ import utils as execution
 import strategy
 
 
-def test_entry_buys_protection_before_short(client):
-    strategy.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
+def test_entry_buys_protection_before_short(client, chain):
+    strategy.place_credit_spread_entry(client,*strategy.option_legs(chain, "BULLISH"),25)
     assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list]==["BUY","SELL"]
     assert client.get_order_by_id.call_count == 2
 
 
-def test_failed_buy_submission_blocks_short(client):
+def test_failed_buy_submission_blocks_short(client, chain):
     client.place_order.return_value={"status":"failure"}
     with pytest.raises(ValueError):
-        strategy.place_credit_spread_entry(client,{"security_id":"101"},{"security_id":"102"},25)
+        strategy.place_credit_spread_entry(client,*strategy.option_legs(chain, "BULLISH"),25)
     assert client.place_order.call_count==1
 
 
-def test_entry_waits_for_hedge_fill_and_blocks_short_when_unknown(client, monkeypatch):
+def test_entry_waits_for_hedge_fill_and_blocks_short_when_unknown(client, monkeypatch, chain):
     monkeypatch.setattr(execution, "EXIT_ORDER_POLL_ATTEMPTS", 1)
     client.get_order_by_id.return_value = {"data": {"orderStatus": "PENDING", "filledQty": 0}}
     with pytest.raises(ValueError, match="BUY_PROTECTION was not fully traded"):
-        strategy.place_credit_spread_entry(client, {"security_id": "101"}, {"security_id": "102"}, 25)
+        strategy.place_credit_spread_entry(client, *strategy.option_legs(chain, "BULLISH"), 25)
     assert client.place_order.call_count == 1
     assert client.place_order.call_args.kwargs["transaction_type"] == "BUY"
 

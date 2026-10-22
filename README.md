@@ -19,8 +19,12 @@ existing main strategy schedule. Each invocation performs one cycle:
 minutes. It books the spread when combined running profit reaches **50% of
 initial credit profit**. This threshold is fixed for now. It uses the actual
 matched position quantity, requires one matching short/long option pair, and
-does not fetch candles, calculate Supertrend, enter or immediately re-enter.
-After a successful profit exit, the next main strategy cycle may enter again.
+after a successful live profit exit confirms the account is flat, then immediately
+calls the entry logic in `strategy.py` within the same account lock. Re-entry
+fetches fresh completed candles and the option chain, follows the current
+Supertrend direction, and applies the same funds checks and cheaper-option
+fallback. Incomplete exits and dry runs never trigger a live re-entry. A failed
+re-entry returns a failed job; it does not retry or duplicate the profit exit.
 Both calculations exclude brokerage, taxes and execution slippage; a target
 observed from LTP does not guarantee that exact realised profit.
 
@@ -32,6 +36,35 @@ The sequencing comments in both execution functions explain this requirement.
 
 Both executables retain the existing live-order flags: `DRY_RUN=false` and
 `LIVE_TRADING_ENABLED=true` are required to submit orders.
+
+## Entry funds and cheaper options
+
+Before every live entry (including immediate re-entry), the strategy reads Dhan's
+available trading balance and calculates the proposed two-leg basket margin via
+`/margincalculator/multi`. It reserves **basket margin plus the hedge ask price
+times quantity, with 5% headroom** for costs and price movement. This deliberately
+conservative budget may exceed the broker's actual requirement; it does not rely
+on short-sale proceeds or treat maximum spread loss as margin. Existing positions
+and orders are excluded from the proposed basket calculation; normal entry runs
+only when strategy positions are flat, and pending F&O orders block entry.
+
+The usual short nearest delta 0.50 and hedge nearest half its premium are tried
+first. If unaffordable, progressively cheaper short premiums farther OTM are
+tested in the same option chain. Direction, expiry, lot count, hedge strike
+orientation, half-premium hedge target and exit rules stay the same. **Fallback
+short delta can differ from 0.50**, and spread width and credit can change. The
+fallback hedge must cost no more than the original hedge. Every candidate must
+have a valid positive bid/ask credit spread and pass its own broker margin check.
+
+Funds and margin are checked again immediately before the hedge order. Invalid
+broker responses or no affordable candidate stop entry without submitting orders.
+Logs report required and available funds and any fallback selection. Dry runs
+retain signal-only proposals and explicitly mark funding as unchecked; they do
+not certify affordability. Margin estimates and headroom cannot guarantee market
+order acceptance or fills. The existing hedge-first fill confirmation remains;
+if the short subsequently fails, the filled hedge can remain for inspection.
+
+API reference: [Dhan funds and margin](https://dhanhq.co/docs/v2/funds/).
 
 ## Rejected orders and incomplete exits
 
@@ -59,7 +92,7 @@ handled as described above.
 ## Runtime configuration
 
 Both scripts use configuration from `utils.py`. Supertrend and index settings
-are only used by the main strategy:
+are also passed to profit booking for immediate re-entry:
 
 - Secrets: `CLIENT_ID`, `DHAN_ACCESS_TOKEN`
 - Required variables: `NIFTY_QUANTITY`, `NIFTY_LOT_SIZE`, `DRY_RUN`,

@@ -8,6 +8,7 @@ import sys
 import pytest
 
 import profit_booking
+import strategy
 import utils
 
 
@@ -28,7 +29,10 @@ def test_fixed_fifty_percent_target(config, client, positions, caplog, price, hi
     client.place_order.assert_not_called()
 
 
-def test_live_profit_exit_closes_both_legs_without_entry(config, client, positions, monkeypatch, caplog):
+def test_live_profit_exit_closes_both_legs_then_enters(config, client, positions, monkeypatch, caplog, chain, analysis):
+    market = Mock(return_value=analysis)
+    monkeypatch.setattr(strategy, "analyse_market", market)
+    monkeypatch.setattr(strategy, "dhan_request", Mock(side_effect=[{"data": ["2026-10-27", "2026-11-03"]}, chain]))
     monkeypatch.setattr(utils.time, "sleep", lambda _: None)
     cfg = replace(config, dry_run=False, live_trading_enabled=True)
     client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"] = 76
@@ -36,9 +40,12 @@ def test_live_profit_exit_closes_both_legs_without_entry(config, client, positio
                                        {"data": [positions[1]]}, {"data": []}, {"data": []}, {"data": []}]
     with caplog.at_level("INFO"):
         assert profit_booking.run_profit_booking(cfg, client) == 0
-    assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list] == ["BUY", "SELL"]
+    assert [c.kwargs["transaction_type"] for c in client.place_order.call_args_list] == ["BUY", "SELL", "BUY", "SELL"]
     assert "PROFIT_EXIT_CONFIRMED" in caplog.text
-    assert "REENTRY" not in caplog.text
+    assert "PROFIT_REENTRY_COMPLETED" in caplog.text
+    market.assert_called_once_with(cfg)
+    assert client.get_fund_limits.call_count == 2
+    assert [c.kwargs["security_id"] for c in client.place_order.call_args_list] == ["101", "102", "102", "101"]
 
 
 def test_unmatched_hedge_reports_incomplete_spread(config, client, positions, caplog):
@@ -100,9 +107,39 @@ def test_invalid_spread_cannot_trigger_profit_exit(client, positions, field, val
 
 
 def test_profit_exit_not_confirmed_flat_returns_failure(config, client, positions, monkeypatch):
+    entry = Mock()
+    monkeypatch.setattr(strategy, "entry_check", entry)
     cfg = replace(config, dry_run=False, live_trading_enabled=True)
     client.get_positions.return_value = {"data": positions}
     client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"] = 76
     monkeypatch.setattr(utils, "close_open_fno_positions", lambda *_: [])
     monkeypatch.setattr(utils, "EXIT_ORDER_POLL_TIMEOUT_SECONDS", 0)
     assert profit_booking.run_profit_booking(cfg, client) == 1
+    entry.assert_not_called()
+
+
+@pytest.mark.parametrize("result", [0, 1])
+def test_profit_reentry_result_is_returned(config, client, positions, monkeypatch, result):
+    cfg = replace(config, dry_run=False, live_trading_enabled=True)
+    client.get_positions.return_value = {"data": positions}
+    client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"] = 76
+    calls = []
+    monkeypatch.setattr(utils, "close_open_fno_positions", lambda *_: calls.append("exit") or [])
+    monkeypatch.setattr(utils, "wait_for_strategy_flat", lambda *_: calls.append("flat") or (True, []))
+    entry = Mock(side_effect=lambda *_args, **_kwargs: calls.append("entry") or result)
+    monkeypatch.setattr(strategy, "entry_check", entry)
+    assert profit_booking.run_profit_booking(cfg, client) == result
+    assert calls == ["exit", "flat", "entry"]
+    entry.assert_called_once_with(cfg, client, reentry=True)
+
+
+def test_failed_profit_exit_never_reenters(config, client, positions, monkeypatch):
+    cfg = replace(config, dry_run=False, live_trading_enabled=True)
+    client.get_positions.return_value = {"data": positions}
+    client.ticker_data.return_value["data"]["data"]["NSE_FNO"]["101"]["last_price"] = 76
+    monkeypatch.setattr(utils, "close_open_fno_positions", Mock(side_effect=ValueError("rejected")))
+    entry = Mock()
+    monkeypatch.setattr(strategy, "entry_check", entry)
+    with pytest.raises(ValueError, match="rejected"):
+        profit_booking.run_profit_booking(cfg, client)
+    entry.assert_not_called()

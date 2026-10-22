@@ -100,10 +100,10 @@ def test_pending_broker_order_blocks_new_submissions(client, positions, entry):
     client.place_order.assert_not_called()
 
 
-def test_entry_hedge_rejection_blocks_short(client):
+def test_entry_hedge_rejection_blocks_short(client, chain):
     client.get_order_by_id.return_value = rejected("Order rejected")
     with pytest.raises(ValueError, match="BUY_PROTECTION"):
-        strategy.place_credit_spread_entry(client, {"security_id": "101"}, {"security_id": "102"}, 25)
+        strategy.place_credit_spread_entry(client, *strategy.option_legs(chain, "BULLISH"), 25)
     assert client.place_order.call_count == 1
 
 

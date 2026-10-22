@@ -266,7 +266,8 @@ def next_expiry(expiry_response: dict[str, Any]) -> str:
 
 def option_legs(
     chain_response: dict[str, Any],
-    signal: str
+    signal: str,
+    sell_security_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return sell Δ0.50 and protective buy whose premium is ~50% of sell premium."""
 
@@ -295,7 +296,9 @@ def option_legs(
 
         if (
             isinstance(delta, (int, float))
+            and math.isfinite(delta)
             and isinstance(last_price, (int, float))
+            and math.isfinite(last_price)
             and last_price > 0
             and leg.get("security_id")
         ):
@@ -315,7 +318,7 @@ def option_legs(
 
     # Sell leg: closest to delta 0.50
     sell = min(
-        candidates,
+        [leg for leg in candidates if sell_security_id is None or leg["security_id"] == sell_security_id],
         key=lambda item: abs(item["delta"] - target_sell)
     )
 
@@ -346,6 +349,8 @@ def spread_payoff(sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> d
     sell_bid, buy_ask = sell.get("top_bid_price"), buy.get("top_ask_price")
     if not isinstance(sell_bid, (int, float)) or not isinstance(buy_ask, (int, float)):
         raise ValueError("Option-chain response is missing executable bid/ask prices.")
+    if not all(math.isfinite(value) and value > 0 for value in (sell_bid, buy_ask)):
+        raise ValueError("Option bid/ask prices must be positive and finite.")
     credit = float(sell_bid) - float(buy_ask)
     width = abs(float(sell["strike"]) - float(buy["strike"]))
     if credit <= 0:
@@ -355,6 +360,85 @@ def spread_payoff(sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> d
     return {"net_credit_per_unit": credit, "maximum_profit": credit * quantity, "maximum_loss": (width - credit) * quantity, "profit_booking_debit_per_unit": credit / 2, "profit_booking_amount": (credit / 2) * quantity, "spread_width": width}
 
 
+def broker_amount(response: Any, field: str) -> float:
+    """Fail closed on missing, failed or non-finite broker estimates."""
+    if not isinstance(response, dict) or str(response.get("status", "")).lower() == "failure":
+        raise ValueError(f"Dhan {field} response failed.")
+    data = response.get("data", response)
+    value = data.get(field) if isinstance(data, dict) else None
+    try:
+        amount = float(value) if not isinstance(value, bool) else float("nan")
+    except (TypeError, ValueError):
+        raise ValueError(f"Dhan {field} is missing or invalid.") from None
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError(f"Dhan {field} must be finite and nonnegative.")
+    return amount
+
+
+def entry_funding(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> dict[str, Any]:
+    """Budget hedge cash plus basket margin, with 5% headroom for costs/movement.
+
+    Deliberately do not spend expected short-sale proceeds or assume the final
+    spread's maximum loss equals the broker's required margin.
+    """
+    spread_payoff(sell, buy, quantity)
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise ValueError("Entry quantity must be a positive integer.")
+    scripts = [dict(securityId=str(leg["security_id"]), exchangeSegment="NSE_FNO",
+                    transactionType=side, quantity=quantity, productType="MARGIN",
+                    price=leg[price_key])
+               for leg, side, price_key in ((buy, "BUY", "top_ask_price"),
+                                            (sell, "SELL", "top_bid_price"))]
+    margin = broker_amount(dhan.dhan_http.post("/margincalculator/multi", {
+        "includePosition": False, "includeOrders": False, "scripts": scripts,
+    }), "total_margin")
+    if margin <= 0:
+        raise ValueError("Dhan returned zero margin for an option credit spread.")
+    hedge_cash = float(buy["top_ask_price"]) * quantity
+    required = math.ceil((margin + hedge_cash) * 1.05 * 100) / 100
+    available = broker_amount(dhan.get_fund_limits(), "availabelBalance")
+    result = dict(basket_margin=margin, hedge_cash=hedge_cash,
+                  required_funds=required, available_funds=available,
+                  affordable=available >= required)
+    log_event("ENTRY_FUNDS_CHECKED", sell_security_id=sell["security_id"],
+              buy_security_id=buy["security_id"], quantity=quantity, **result)
+    return result
+
+
+def affordable_option_legs(dhan: Any, chain: dict[str, Any], signal: str, quantity: int):
+    """Try the normal spread first, then cheaper shorts farther OTM."""
+    original_sell, original_buy = option_legs(chain, signal)
+    funding = entry_funding(dhan, original_sell, original_buy, quantity)
+    if funding["affordable"]:
+        return original_sell, original_buy, funding
+    side = "pe" if signal == "BULLISH" else "ce"
+    candidates = []
+    for strike, legs in chain["data"]["oc"].items():
+        leg = legs.get(side) if isinstance(legs, dict) else None
+        if not isinstance(leg, dict):
+            continue
+        price = leg.get("last_price")
+        farther_otm = float(strike) < original_sell["strike"] if signal == "BULLISH" else float(strike) > original_sell["strike"]
+        if (farther_otm and isinstance(price, (int, float)) and math.isfinite(price)
+                and 0 < price < original_sell["last_price"] and leg.get("security_id")):
+            candidates.append((float(price), str(leg["security_id"])))
+    for _, security_id in sorted(candidates, reverse=True):
+        try:
+            sell, buy = option_legs(chain, signal, security_id)
+            spread_payoff(sell, buy, quantity)
+            if buy["top_ask_price"] > original_buy["top_ask_price"]:
+                continue
+        except ValueError:
+            continue
+        # Broker failures abort the scan; they are not evidence of low funds.
+        funding = entry_funding(dhan, sell, buy, quantity)
+        if funding["affordable"]:
+            log_event("ENTRY_CHEAPER_OPTIONS_SELECTED", original_sell=original_sell,
+                      sell=sell, buy=buy, funding=funding)
+            return sell, buy, funding
+    raise ValueError("No affordable valid credit spread is available; no entry orders submitted.")
+
+
 def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, Any], quantity: int) -> list[dict[str, Any]]:
     """Buy and confirm the hedge before submitting the short option.
 
@@ -362,6 +446,8 @@ def place_credit_spread_entry(dhan: Any, sell: dict[str, Any], buy: dict[str, An
     short leg is opened so the broker recognises the protected spread.
     """
     utils.ensure_no_pending_orders(dhan)
+    if not entry_funding(dhan, sell, buy, quantity)["affordable"]:
+        raise ValueError("Entry funds changed or are insufficient; no orders submitted.")
     orders: list[dict[str, Any]] = []
     for leg_name, leg, transaction_type in (
         ("BUY_PROTECTION", buy, "BUY"),
@@ -412,13 +498,17 @@ def entry_check(
         lots = config.nifty_quantity
         lot_size = config.nifty_lot_size
         quantity = lots * lot_size
+        funding = {"status": "not_checked_dry_run"}
+        if config.live_trading_enabled and not config.dry_run:
+            utils.ensure_no_pending_orders(dhan)
+            sell, buy, funding = affordable_option_legs(dhan, chain, signal, quantity)
         log_event("ENTRY_QUANTITY_RESOLVED", lots=lots, lot_size=lot_size, quantity=quantity)
         payoff = spread_payoff(sell, buy, quantity)
         log_event("ENTRY_LEGS_SELECTED", signal=signal, expiry=expiry, sell=sell, buy=buy, payoff=payoff, quantity=quantity)
         option_type = "PUT" if signal == "BULLISH" else "CALL"
         trigger = "current 30-minute Supertrend direction"
         print(f"{trigger}: propose next-expiry ({expiry}) {option_type} credit spread:")
-        output: dict[str, Any] = {"SELL": sell, "BUY": buy, "payoff": payoff, "lots": lots, "lot_size": lot_size, "quantity": quantity, "dry_run": config.dry_run}
+        output: dict[str, Any] = {"SELL": sell, "BUY": buy, "payoff": payoff, "funding": funding, "lots": lots, "lot_size": lot_size, "quantity": quantity, "dry_run": config.dry_run}
         if not config.live_trading_enabled or config.dry_run:
             print(json.dumps(output, indent=2))
             log_event("DRY_RUN_REENTRY_SIGNAL" if reentry else "DRY_RUN_ENTRY_SIGNAL", signal=signal, expiry=expiry, sell=sell, buy=buy, payoff=payoff, quantity=quantity)

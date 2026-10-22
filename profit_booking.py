@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the fixed 50% credit-profit target and close the spread, without entry."""
+"""Book the fixed 50% credit-profit target, then immediately re-enter when flat."""
 
 import json
 import logging
@@ -16,7 +16,7 @@ def in_trading_session(now: datetime | None = None) -> bool:
 
 
 def run_profit_booking(config: utils.StrategyConfig, dhan: Any) -> int:
-    """Perform one profit-only cycle; partial exits are errors, never new entries."""
+    """Book profit and re-enter; partial exits are errors, never new entries."""
     config.validate()
     positions = utils.dhan_positions(dhan)
     if not utils.active_strategy_position(positions):
@@ -41,7 +41,17 @@ def run_profit_booking(config: utils.StrategyConfig, dhan: Any) -> int:
     output = {"profit_check": check, "orders": orders, "remaining_positions": remaining}
     print(json.dumps(output, indent=2, default=str))
     utils.log_event("PROFIT_EXIT_CONFIRMED" if flat else "PROFIT_EXIT_INCOMPLETE", **output)
-    return 0 if flat else 1
+    if not flat:
+        return 1
+
+    # Reuse strategy entry inside the existing account lock. Calling main() or
+    # spawning another process would attempt to acquire that lock a second time.
+    import strategy
+
+    utils.log_event("PROFIT_REENTRY_STARTED")
+    result = strategy.entry_check(config, dhan, reentry=True)
+    utils.log_event("PROFIT_REENTRY_COMPLETED" if result == 0 else "PROFIT_REENTRY_FAILED", result=result)
+    return result
 
 
 def main() -> int:
